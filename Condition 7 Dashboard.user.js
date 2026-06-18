@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.3.2
+// @version      1.3.3
 // @description  Hosted/local standalone helper that fetches Rodeo Scanned ItemList in the background and sends one deduplicated Slack callout alert per shipment.
 // @author       Prince Jacob (Wprijaco)
+// @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
+// @downloadURL  https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @match        file:///*
 // @match        https://p2rc7dwell.thejacobslab.com/*
 // @connect      rodeo-dub.amazon.com
@@ -25,7 +27,7 @@ if(document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)){
   console.warn('[Condition 7 Standalone] Another helper instance is already active. This copy will stop.');
   return;
 }
-document.documentElement.setAttribute(INSTANCE_ATTRIBUTE,'1.3.2');
+document.documentElement.setAttribute(INSTANCE_ATTRIBUTE,'1.3.3');
 
 const REFRESH_MS=60000;
 const CPT_OFFSET_MIN=60;
