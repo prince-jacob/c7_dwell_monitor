@@ -1,16 +1,21 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.4.0
-// @description  Access-controlled standalone Condition 7 dashboard helper with Flow Sortation login verification, background Rodeo refresh, and optional Slack callout alerts.
+// @version      1.5.0
+// @description  Cloud-authorised Condition 7 dashboard helper with manual Flow Sortation verification, background Rodeo refresh, and optional Slack callout alerts.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @match        file:///*
 // @match        https://p2rc7dwell.thejacobslab.com/*
+// @match        https://flow-sortation-eu.amazon.com/*
 // @connect      flow-sortation-eu.amazon.com
+// @connect      *.amazon.com
+// @connect      *.amazon.dev
+// @connect      midway-auth.amazon.com
 // @connect      rodeo-dub.amazon.com
 // @connect      hooks.slack.com
+// @connect      p2rc7dwell.thejacobslab.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -20,10 +25,95 @@
 (function () {
   'use strict';
 
+  const FLOW_IDENTITY_CACHE_KEY = 'condition7FlowIdentityCacheV1';
+  const FLOW_CAPTURE_VERSION = '1.5.0';
+
+  function c7IdentityClean(value) {
+    return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  function c7NormalizeLogin(value) {
+    return c7IdentityClean(value).toLowerCase().replace(/[^a-z0-9._-]/g, '');
+  }
+
+  function c7ExtractFlowLogin(htmlText) {
+    const html = String(htmlText || '');
+    const attrMatch = html.match(/data-ng-init=["'][^"']*username\s*=\s*(?:&quot;|&#34;|['"])([a-z0-9._-]+)(?:&quot;|&#34;|['"])/i);
+    if (attrMatch && attrMatch[1]) return c7NormalizeLogin(attrMatch[1]);
+
+    const rawMatch = html.match(/username\s*=\s*(?:&quot;|&#34;|['"])([a-z0-9._-]+)(?:&quot;|&#34;|['"])/i);
+    if (rawMatch && rawMatch[1]) return c7NormalizeLogin(rawMatch[1]);
+
+    const text = c7IdentityClean(document.body ? document.body.textContent : html);
+    const welcomeMatch = text.match(/Welcome,\s*([a-z0-9._-]+)/i);
+    return welcomeMatch && welcomeMatch[1] ? c7NormalizeLogin(welcomeMatch[1]) : '';
+  }
+
+  function c7StoreFlowLogin(login, source) {
+    const safeLogin = c7NormalizeLogin(login);
+    if (!safeLogin) return false;
+    try {
+      GM_setValue(FLOW_IDENTITY_CACHE_KEY, JSON.stringify({
+        login: safeLogin,
+        checkedAt: Date.now(),
+        source: source || 'flow-sortation-page',
+        helperVersion: FLOW_CAPTURE_VERSION
+      }));
+      GM_setValue('condition7LastFlowLogin', safeLogin);
+      GM_setValue('condition7LastFlowLoginCheckedAt', Date.now());
+      console.log(`[Condition 7 Standalone] Stored Flow Sortation login: ${safeLogin}`);
+      return true;
+    } catch (error) {
+      console.error('[Condition 7 Standalone] Could not store Flow Sortation login:', error);
+      return false;
+    }
+  }
+
+  function c7ShowFlowCaptureBadge(message, good = true) {
+    try {
+      let badge = document.getElementById('c7-flow-capture-badge');
+      if (!badge) {
+        badge = document.createElement('div');
+        badge.id = 'c7-flow-capture-badge';
+        badge.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;padding:10px 14px;border-radius:12px;font:700 12px Arial,sans-serif;color:#fff;box-shadow:0 12px 32px rgba(0,0,0,.35);max-width:360px;';
+        document.body.appendChild(badge);
+      }
+      badge.style.background = good ? '#047857' : '#b45309';
+      badge.textContent = message;
+      clearTimeout(c7ShowFlowCaptureBadge.timer);
+      c7ShowFlowCaptureBadge.timer = setTimeout(() => badge.remove(), 6000);
+    } catch (_) { /* no-op */ }
+  }
+
+  function c7CaptureFlowIdentityFromThisPage() {
+    let attempts = 0;
+    const scan = () => {
+      attempts += 1;
+      const login = c7ExtractFlowLogin(document.documentElement.outerHTML || '');
+      if (login) {
+        c7StoreFlowLogin(login, 'flow-sortation-live-page');
+        c7ShowFlowCaptureBadge(`C7 Dashboard access verified as ${login}. Now refresh/open the C7 dashboard.`, true);
+        return;
+      }
+      if (attempts < 30) {
+        setTimeout(scan, 1000);
+      } else {
+        c7ShowFlowCaptureBadge('C7 helper could not find the Flow Sortation username on this page.', false);
+        console.warn('[Condition 7 Standalone] Flow page loaded but username was not found.');
+      }
+    };
+    scan();
+  }
+
+  if (location.hostname === 'flow-sortation-eu.amazon.com') {
+    c7CaptureFlowIdentityFromThisPage();
+    return;
+  }
+
   const DASHBOARD_MARKER = 'meta[name="condition7-dashboard"][content="wprijaco-v1"]';
   if (!document.querySelector(DASHBOARD_MARKER)) return;
 
-  const HELPER_VERSION = '1.4.0';
+  const HELPER_VERSION = '1.5.0';
   const INSTANCE_ATTRIBUTE = 'data-condition7-helper-active';
 
   if (document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)) {
@@ -32,10 +122,8 @@
   }
   document.documentElement.setAttribute(INSTANCE_ATTRIBUTE, HELPER_VERSION);
 
-  /* Add or remove approved Amazon aliases here. Always use lowercase. */
-  const ALLOWED_USERS = Object.freeze([
-    'wprijaco'
-  ]);
+  // Approved users are now checked on your server, not inside this script.
+  const ACCESS_API_URL = 'https://p2rc7dwell.thejacobslab.com/api/c7_check_access.php';
 
   const REFRESH_MS = 60_000;
   const ACCESS_RECHECK_MS = 15 * 60_000;
@@ -62,6 +150,7 @@
   let accessRequestRunning = false;
   let accessApproved = false;
   let currentLogin = '';
+  let currentAccessToken = '';
   let dashboardReady = false;
 
   const slackPending = new Set();
@@ -79,8 +168,204 @@
     try { GM_setValue(key, value); } catch (_) { /* no-op */ }
   };
 
+  const FLOW_IDENTITY_MAX_AGE_MS = 8 * 60 * 60 * 1000;
+
+  function readFlowIdentityCache() {
+    try {
+      const raw = GM_getValue(FLOW_IDENTITY_CACHE_KEY, '');
+      const cached = raw ? JSON.parse(raw) : null;
+      if (!cached || !cached.login) return null;
+      const login = normalizeLogin(cached.login);
+      const checkedAt = Number(cached.checkedAt || 0);
+      if (!login || !checkedAt) return null;
+      return { login, checkedAt, ageMs: Date.now() - checkedAt, source: cached.source || 'flow-cache' };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function authorizeLoginWithCloud(login, context, callback) {
+    const safeLogin = normalizeLogin(login);
+    if (!safeLogin) {
+      callback(new Error('No Amazon login was available for cloud verification'));
+      return;
+    }
+
+    const payload = {
+      login: safeLogin,
+      source: context?.source || 'flow-cache',
+      checkedAt: context?.checkedAt || Date.now(),
+      helperVersion: HELPER_VERSION,
+      dashboardOrigin: location.origin,
+      dashboardHost: location.hostname
+    };
+
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: ACCESS_API_URL,
+      anonymous: false,
+      timeout: 15_000,
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json'
+      },
+      data: JSON.stringify(payload),
+      onload: response => {
+        let data = null;
+        try {
+          data = JSON.parse(String(response.responseText || '{}'));
+        } catch (error) {
+          callback(new Error(`Cloud access API returned invalid JSON. HTTP ${response.status || 'unknown'}`));
+          return;
+        }
+
+        if (response.status && (response.status < 200 || response.status >= 300)) {
+          callback(new Error(data.message || `Cloud access API returned HTTP ${response.status}`), data);
+          return;
+        }
+
+        callback(null, data);
+      },
+      onerror: () => callback(new Error('Cloud access API request failed. Check the PHP file path, HTTPS, and @connect permission.')),
+      ontimeout: () => callback(new Error('Cloud access API timed out after 15 seconds.'))
+    });
+  }
+
+  function approveOrDenyCachedLogin(cached) {
+    currentLogin = cached.login;
+    currentAccessToken = '';
+    accessApproved = false;
+    stopMonitoring(true);
+
+    sendAccess('checking', {
+      login: cached.login,
+      message: 'Checking cloud access…',
+      detail: `Amazon login ${cached.login} was verified from Flow Sortation. Checking server allowlist now.`
+    });
+    sendStatus('Checking cloud access…', `Verifying ${cached.login} with server allowlist`);
+
+    authorizeLoginWithCloud(cached.login, cached, (error, result) => {
+      if (error) {
+        accessApproved = false;
+        currentAccessToken = '';
+        stopMonitoring(true);
+        sendAccess('error', {
+          login: cached.login,
+          message: 'Cloud access check failed',
+          detail: error.message || String(error)
+        });
+        sendStatus('Cloud access check failed', error.message || String(error), 'error');
+        return;
+      }
+
+      if (!result || result.allowed !== true) {
+        accessApproved = false;
+        currentAccessToken = '';
+        stopMonitoring(true);
+        sendAccess('denied', {
+          login: cached.login,
+          message: 'Access denied',
+          detail: result?.message || `${cached.login} is not authorised by the server allowlist.`
+        });
+        sendStatus('Access denied', `${cached.login} is not approved on the cloud allowlist`, 'error');
+        return;
+      }
+
+      accessApproved = true;
+      currentAccessToken = String(result.token || '');
+      currentLogin = normalizeLogin(result.login || cached.login);
+      sendAccess('approved', {
+        login: currentLogin,
+        message: `Access approved for ${currentLogin}`,
+        detail: result.expiresAt
+          ? `Cloud authorisation valid until ${result.expiresAt}.`
+          : 'Cloud authorisation approved.'
+      });
+      sendStatus('Access approved', `Signed in as ${currentLogin}`);
+      startMonitoring();
+    });
+  }
+
   function emit(name, detail = {}) {
     document.dispatchEvent(new CustomEvent(name, { detail }));
+  }
+
+  function forceAccessGate(state, options = {}) {
+    // v1.4.5: Script-only fallback. This directly updates the existing v1.4.0
+    // access gate, so users do not need to replace the hosted HTML while debugging.
+    const gate = document.getElementById('accessGate');
+    const title = document.getElementById('accessTitle');
+    const message = document.getElementById('accessMessage');
+    const icon = document.getElementById('accessIcon');
+    const loginBox = document.getElementById('accessLogin');
+    const meta = document.getElementById('accessMeta');
+    const user = document.getElementById('accessUser');
+    const actionIds = ['installHelper', 'openFlow', 'openRodeo', 'retryAccess'];
+    const showActions = options.actions || [];
+    if (!gate || !title || !message || !icon) return;
+
+    const login = options.login || currentLogin || '';
+    let iconText = '🔎';
+    let tone = 'wait';
+    let heading = options.message || 'Verifying Amazon login…';
+    let body = options.detail || 'Checking your Flow Sortation session.';
+
+    if (state === 'approved') {
+      gate.classList.add('hidden');
+      document.body.classList.remove('c7-locked');
+      if (user) {
+        user.textContent = `✓ ${login || currentLogin || 'approved'}`;
+        user.classList.add('ok');
+      }
+      return;
+    }
+
+    if (state === 'login-required') {
+      iconText = '🔑';
+      tone = 'bad';
+      heading = options.message || 'Amazon sign-in required';
+      body = options.detail || 'Open Flow Sortation, complete Midway sign-in, then retry.';
+      if (!showActions.length) showActions.push('openFlow', 'retryAccess');
+    } else if (state === 'denied') {
+      iconText = '⛔';
+      tone = 'bad';
+      heading = options.message || 'Access denied';
+      body = options.detail || 'This Amazon login is not authorised to use the dashboard.';
+    } else if (state === 'error') {
+      iconText = '⚠️';
+      tone = 'bad';
+      heading = options.message || 'Unable to verify access';
+      body = options.detail || 'Open Flow Sortation and Rodeo, then retry verification.';
+      if (!showActions.length) showActions.push('openFlow', 'openRodeo', 'retryAccess');
+    }
+
+    document.body.classList.add('c7-locked');
+    gate.classList.remove('hidden');
+    title.textContent = heading;
+    message.textContent = body;
+    icon.textContent = iconText;
+    icon.className = `access-icon ${tone}`;
+    if (loginBox) {
+      loginBox.classList.toggle('show', Boolean(login));
+      loginBox.innerHTML = login ? `Detected Amazon login: <b>${String(login).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}</b>` : '';
+    }
+    if (meta) meta.textContent = `Dashboard v1.4.x • Helper v${HELPER_VERSION} • Flow-capture mode`;
+    if (user) {
+      user.textContent = login ? `Locked • ${login}` : 'Access locked';
+      user.classList.remove('ok');
+    }
+    for (const id of actionIds) {
+      const el = document.getElementById(id);
+      if (el) el.classList.toggle('hidden', !showActions.includes(id));
+    }
+
+    const openFlowButton = document.getElementById('openFlow');
+    if (openFlowButton) {
+      openFlowButton.textContent = 'Verify Amazon Login';
+      openFlowButton.href = 'https://flow-sortation-eu.amazon.com/NCL1/#/afe/workforce';
+      openFlowButton.target = '_blank';
+      openFlowButton.rel = 'noopener noreferrer';
+    }
   }
 
   function sendStatus(message, detail = '', level = 'info') {
@@ -101,13 +386,14 @@
   }
 
   function sendAccess(state, options = {}) {
+    forceAccessGate(state, options);
     emit('condition7-access', {
       state,
       login: options.login || currentLogin || '',
       message: options.message || '',
       detail: options.detail || '',
       helperVersion: HELPER_VERSION,
-      allowedUsersCount: ALLOWED_USERS.length
+      cloudAccess: true
     });
   }
 
@@ -153,8 +439,54 @@
     if (clearDashboard) sendData({ shipments: [], sourceRows: 0, accessRevoked: true });
   }
 
+  function flowResponseSummary(response, elapsedMs) {
+    const status = response?.status ?? 'unknown';
+    const finalUrl = String(response?.finalUrl || response?.responseURL || FLOW_IDENTITY_URL);
+    const length = String(response?.responseText || '').length;
+    return `Flow response: HTTP ${status} • ${Math.round(elapsedMs / 1000)}s • ${length} chars • ${finalUrl}`;
+  }
+
+  function finishAccessCheck(requestId, startedAt, doneFlag, callback) {
+    if (doneFlag.value) return false;
+    doneFlag.value = true;
+    clearTimeout(doneFlag.stillWaitingTimer);
+    clearTimeout(doneFlag.hardTimeoutTimer);
+    callback(Date.now() - startedAt);
+    return true;
+  }
+
   function verifyAccess(force = false) {
-    if (accessRequestRunning) return;
+    const cachedIdentity = readFlowIdentityCache();
+    if (cachedIdentity && cachedIdentity.ageMs <= FLOW_IDENTITY_MAX_AGE_MS) {
+      approveOrDenyCachedLogin(cachedIdentity);
+      return;
+    }
+
+    // v1.4.5: manual verification mode.
+    // Do not auto-open Flow Sortation and do not use background Flow XHR.
+    // The user clicks the Verify/Open Flow button, the same helper runs on Flow, captures username,
+    // stores it in Tampermonkey storage, then the user returns here and presses Retry/refreshes.
+    accessRequestRunning = false;
+    accessApproved = false;
+    currentLogin = '';
+    stopMonitoring(true);
+    sendAccess('error', {
+      message: cachedIdentity ? 'Flow verification expired' : 'Verify Amazon Login',
+      detail: cachedIdentity
+        ? `Last Flow Sortation verification for ${cachedIdentity.login} is ${Math.round(cachedIdentity.ageMs / 60000)} minute(s) old. Click Verify Amazon Login, wait for the green C7 verified message on Flow Sortation, then return here and press Retry.`
+        : 'Click Verify Amazon Login. Flow Sortation will open in a normal tab. Wait until you see the green C7 verified message, then return here and press Retry or refresh this dashboard.',
+      actions: ['openFlow', 'retryAccess']
+    });
+    sendStatus('Waiting for manual Flow Sortation verification', 'Click Verify Amazon Login, then retry after the green C7 verified message appears', 'error');
+    return;
+
+    if (accessRequestRunning) {
+      sendAccess('checking', {
+        message: 'Still verifying Amazon login…',
+        detail: 'A Flow Sortation identity request is already running. Wait a few seconds or press Retry once.'
+      });
+      return;
+    }
     if (!force && accessApproved && currentLogin) {
       sendAccess('approved', {
         login: currentLogin,
@@ -163,104 +495,125 @@
       return;
     }
 
+    const requestId = `flow-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const startedAt = Date.now();
+    const doneFlag = { value: false, stillWaitingTimer: null, hardTimeoutTimer: null };
+    const identityUrl = `${FLOW_IDENTITY_URL}${FLOW_IDENTITY_URL.includes('?') ? '&' : '?'}c7IdentityCheck=${Date.now()}`;
+
     accessRequestRunning = true;
     sendAccess('checking', {
-      message: 'Checking the logged-in Amazon user…',
-      detail: 'Verifying your Flow Sortation session'
+      message: 'Verifying Amazon login…',
+      detail: 'Requesting Flow Sortation identity page in the background.'
     });
-    sendStatus('Verifying access…', 'Checking the logged-in Flow Sortation user');
+    sendStatus('Verifying access…', 'Requesting Flow Sortation identity page');
+
+    doneFlag.stillWaitingTimer = setTimeout(() => {
+      if (doneFlag.value) return;
+      sendAccess('checking', {
+        message: 'Still verifying Amazon login…',
+        detail: 'No response from Flow Sortation yet. This usually means Tampermonkey @connect permission, Firefox container/session, or Midway redirect is blocking the background request.'
+      });
+      sendStatus('Still verifying access…', 'Waiting for Flow Sortation response');
+    }, 10_000);
+
+    doneFlag.hardTimeoutTimer = setTimeout(() => {
+      finishAccessCheck(requestId, startedAt, doneFlag, elapsedMs => {
+        accessRequestRunning = false;
+        accessApproved = false;
+        currentLogin = '';
+        stopMonitoring(true);
+        sendAccess('error', {
+          message: 'Flow Sortation did not respond',
+          detail: `No callback after ${Math.round(elapsedMs / 1000)} seconds. Open Flow Sortation manually in the same Firefox container, then press Retry. Also confirm Tampermonkey accepted @connect access for flow-sortation-eu.amazon.com and Amazon auth domains.`
+        });
+        sendStatus('Access verification timed out', 'No Flow Sortation response from the helper', 'error');
+      });
+    }, 35_000);
 
     GM_xmlhttpRequest({
       method: 'GET',
-      url: FLOW_IDENTITY_URL,
+      url: identityUrl,
+      anonymous: false,
       timeout: 30_000,
       headers: {
         'Cache-Control': 'no-cache',
         Pragma: 'no-cache'
       },
       onload: response => {
-        accessRequestRunning = false;
+        finishAccessCheck(requestId, startedAt, doneFlag, elapsedMs => {
+          accessRequestRunning = false;
+          const responseText = String(response.responseText || '');
+          const summary = flowResponseSummary(response, elapsedMs);
+          console.log('[Condition 7 Standalone] Flow identity response:', summary);
 
-        if (response.status === 401 || response.status === 403 || looksLikeAuthenticationPage(response)) {
-          accessApproved = false;
-          currentLogin = '';
-          stopMonitoring(true);
-          sendAccess('login-required', {
-            message: 'Amazon sign-in required',
-            detail: 'Open Flow Sortation, complete Midway sign-in, then press Retry.'
-          });
-          sendStatus('Amazon sign-in required', 'Open Flow Sortation and sign in, then retry', 'error');
-          return;
-        }
+          if (looksLikeAuthenticationPage(response)) {
+            accessApproved = false;
+            currentLogin = '';
+            stopMonitoring(true);
+            sendAccess('login-required', {
+              message: 'Amazon sign-in required',
+              detail: `${summary}. The helper received an authentication or Midway page instead of Flow Sortation. Open Flow Sortation, complete sign-in, then press Retry.`
+            });
+            sendStatus('Amazon sign-in required', 'Open Flow Sortation and sign in, then retry', 'error');
+            return;
+          }
 
-        if (response.status < 200 || response.status >= 400) {
-          accessApproved = false;
-          currentLogin = '';
-          stopMonitoring(true);
-          sendAccess('error', {
-            message: 'Unable to verify access',
-            detail: `Flow Sortation returned HTTP ${response.status}`
-          });
-          sendStatus('Access check failed', `Flow Sortation HTTP ${response.status}`, 'error');
-          return;
-        }
+          const login = extractAmazonLogin(responseText);
+          if (login) {
+            currentLogin = login;
+            c7StoreFlowLogin(login, 'flow-sortation-background-response');
+            approveOrDenyCachedLogin({ login, checkedAt: Date.now(), ageMs: 0, source: 'flow-sortation-background-response' });
+            return;
+          }
 
-        const login = extractAmazonLogin(response.responseText);
-        if (!login) {
+          if (response.status && (response.status < 200 || response.status >= 400)) {
+            accessApproved = false;
+            currentLogin = '';
+            stopMonitoring(true);
+            sendAccess('error', {
+              message: 'Unable to verify access',
+              detail: `${summary}. Flow Sortation returned an error status and no username was found.`
+            });
+            sendStatus('Access check failed', `Flow Sortation HTTP ${response.status}`, 'error');
+            return;
+          }
+
           accessApproved = false;
           currentLogin = '';
           stopMonitoring(true);
           sendAccess('error', {
             message: 'Amazon login could not be identified',
-            detail: 'The Flow Sortation page loaded, but its username field was not found.'
+            detail: `${summary}. The page loaded, but username = 'login' and Welcome, login were not found. Open Flow Sortation manually and confirm it shows Welcome, wprijaco.`
           });
           sendStatus('Unable to identify Amazon login', 'Flow Sortation page format may have changed', 'error');
-          return;
-        }
-
-        currentLogin = login;
-        if (!ALLOWED_USERS.includes(login)) {
-          accessApproved = false;
-          stopMonitoring(true);
-          sendAccess('denied', {
-            login,
-            message: 'Access denied',
-            detail: `${login} is not authorised to use this dashboard.`
-          });
-          sendStatus('Access denied', `${login} is not an approved user`, 'error');
-          return;
-        }
-
-        accessApproved = true;
-        sendAccess('approved', {
-          login,
-          message: `Access approved for ${login}`,
-          detail: 'The dashboard is now connected.'
         });
-        sendStatus('Access approved', `Signed in as ${login}`);
-        startMonitoring();
       },
-      onerror: () => {
-        accessRequestRunning = false;
-        accessApproved = false;
-        currentLogin = '';
-        stopMonitoring(true);
-        sendAccess('error', {
-          message: 'Access verification failed',
-          detail: 'Flow Sortation could not be reached from the helper.'
+      onerror: error => {
+        finishAccessCheck(requestId, startedAt, doneFlag, elapsedMs => {
+          accessRequestRunning = false;
+          accessApproved = false;
+          currentLogin = '';
+          stopMonitoring(true);
+          console.error('[Condition 7 Standalone] Flow identity request failed:', error);
+          sendAccess('error', {
+            message: 'Access verification failed',
+            detail: `Flow Sortation could not be reached from the helper after ${Math.round(elapsedMs / 1000)} seconds. Check Tampermonkey @connect permission and Firefox container/session.`
+          });
+          sendStatus('Access verification failed', 'Check network, Tampermonkey permissions and Flow Sortation access', 'error');
         });
-        sendStatus('Access verification failed', 'Check the network and Flow Sortation access', 'error');
       },
       ontimeout: () => {
-        accessRequestRunning = false;
-        accessApproved = false;
-        currentLogin = '';
-        stopMonitoring(true);
-        sendAccess('error', {
-          message: 'Access verification timed out',
-          detail: 'Open Flow Sortation in another tab and try again.'
+        finishAccessCheck(requestId, startedAt, doneFlag, elapsedMs => {
+          accessRequestRunning = false;
+          accessApproved = false;
+          currentLogin = '';
+          stopMonitoring(true);
+          sendAccess('error', {
+            message: 'Access verification timed out',
+            detail: `Flow Sortation request timed out after ${Math.round(elapsedMs / 1000)} seconds. Open Flow Sortation in the same Firefox container and try again.`
+          });
+          sendStatus('Access verification timed out', 'Open Flow Sortation and retry', 'error');
         });
-        sendStatus('Access verification timed out', 'Open Flow Sortation and retry', 'error');
       }
     });
   }
@@ -532,6 +885,7 @@
       GM_xmlhttpRequest({
         method: 'POST',
         url: webhook,
+        anonymous: false,
         headers: { 'Content-Type': 'application/json' },
         data: JSON.stringify(payload),
         timeout: 20_000,
@@ -641,6 +995,7 @@
     GM_xmlhttpRequest({
       method: 'GET',
       url: TARGET_URL,
+      anonymous: false,
       timeout: 45_000,
       headers: {
         'Cache-Control': 'no-cache',
@@ -697,7 +1052,7 @@
     if (action === 'access-status') {
       sendHelperPong(detail.requestId || '');
       if (accessRequestRunning) {
-        sendAccess('checking', { message: 'Checking the logged-in Amazon user…' });
+        sendAccess('error', { message: 'Verify Amazon Login', detail: 'Click Verify Amazon Login, wait for the green C7 verified message on Flow Sortation, then return here and press Retry.', actions: ['openFlow', 'retryAccess'] });
       } else if (accessApproved) {
         sendAccess('approved', { login: currentLogin, message: `Access approved for ${currentLogin}` });
       } else {
@@ -771,7 +1126,7 @@
   // Announce the helper immediately; the page will also ping repeatedly in case
   // this event fires before its own listener is attached.
   sendHelperPong('startup');
-  sendAccess('checking', { message: 'Checking the logged-in Amazon user…' });
+  sendAccess('error', { message: 'Verify Amazon Login', detail: 'Click Verify Amazon Login, wait for the green C7 verified message on Flow Sortation, then return here and press Retry.', actions: ['openFlow', 'retryAccess'] });
 
   // Fallback for local/hosted pages that dispatched their ready event before
   // Tampermonkey finished injecting this helper.
