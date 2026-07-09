@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.5.0
-// @description  Cloud-authorised Condition 7 dashboard helper with manual Flow Sortation verification, background Rodeo refresh, and optional Slack callout alerts.
+// @version      1.5.1
+// @description  Cloud-authorised Condition 7 dashboard helper with manual Flow verification, 10-hour GitHub update popup, floor C7 totals, Rodeo refresh, and optional Slack alerts.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
@@ -16,9 +16,11 @@
 // @connect      rodeo-dub.amazon.com
 // @connect      hooks.slack.com
 // @connect      p2rc7dwell.thejacobslab.com
+// @connect      raw.githubusercontent.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_info
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -26,7 +28,7 @@
   'use strict';
 
   const FLOW_IDENTITY_CACHE_KEY = 'condition7FlowIdentityCacheV1';
-  const FLOW_CAPTURE_VERSION = '1.5.0';
+  const FLOW_CAPTURE_VERSION = '1.5.1';
 
   function c7IdentityClean(value) {
     return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -113,7 +115,7 @@
   const DASHBOARD_MARKER = 'meta[name="condition7-dashboard"][content="wprijaco-v1"]';
   if (!document.querySelector(DASHBOARD_MARKER)) return;
 
-  const HELPER_VERSION = '1.5.0';
+  const HELPER_VERSION = '1.5.1';
   const INSTANCE_ATTRIBUTE = 'data-condition7-helper-active';
 
   if (document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)) {
@@ -436,7 +438,10 @@
     clearInterval(refreshTimer);
     refreshTimer = null;
     running = false;
-    if (clearDashboard) sendData({ shipments: [], sourceRows: 0, accessRevoked: true });
+    if (clearDashboard) {
+      sendData({ shipments: [], sourceRows: 0, accessRevoked: true });
+      renderFloorTotalsWidget([], 0);
+    }
   }
 
   function flowResponseSummary(response, elapsedMs) {
@@ -616,6 +621,101 @@
         });
       }
     });
+  }
+
+
+  /* ----------------------------- Floor totals ----------------------------- */
+
+  function buildFloorTotals(shipments) {
+    const floors = {
+      '2': { floor: '2', label: 'P2', shipments: 0, items: 0, qty: 0, warn: 0, critical: 0, callout: 0, maxDwell: 0 },
+      '3': { floor: '3', label: 'P3', shipments: 0, items: 0, qty: 0, warn: 0, critical: 0, callout: 0, maxDwell: 0 },
+      '4': { floor: '4', label: 'P4', shipments: 0, items: 0, qty: 0, warn: 0, critical: 0, callout: 0, maxDwell: 0 }
+    };
+
+    for (const shipment of shipments || []) {
+      const shipmentFloors = [...new Set((shipment.floors || []).map(String).filter(Boolean))];
+      for (const floor of shipmentFloors) {
+        if (!floors[floor]) {
+          floors[floor] = { floor, label: floor === 'Other' ? 'Other' : `P${floor}`, shipments: 0, items: 0, qty: 0, warn: 0, critical: 0, callout: 0, maxDwell: 0 };
+        }
+
+        const floorItems = (shipment.items || []).filter(item => String(item.floor || '') === floor);
+        const itemCount = floorItems.length || (shipmentFloors.length === 1 ? (shipment.items || []).length : 0);
+        const qty = floorItems.reduce((sum, item) => sum + (Number(item.qty) || 0), 0);
+
+        floors[floor].shipments += 1;
+        floors[floor].items += itemCount;
+        floors[floor].qty += qty;
+        floors[floor].maxDwell = Math.max(floors[floor].maxDwell, Number(shipment.maxDwell || 0));
+        if (Number(shipment.maxDwell || 0) >= 30) floors[floor].warn += 1;
+        if (Number(shipment.maxDwell || 0) >= 40) floors[floor].critical += 1;
+        if (shipment.calloutRisk) floors[floor].callout += 1;
+      }
+    }
+
+    const ordered = ['2', '3', '4'].map(floor => floors[floor]);
+    const extra = Object.keys(floors).filter(floor => !['2', '3', '4'].includes(floor)).sort().map(floor => floors[floor]);
+    return [...ordered, ...extra];
+  }
+
+  function ensureFloorTotalsWidget() {
+    let widget = document.getElementById('c7-floor-total-widget');
+    if (widget) return widget;
+
+    const styleId = 'c7-floor-total-widget-style';
+    if (!document.getElementById(styleId)) {
+      const style = document.createElement('style');
+      style.id = styleId;
+      style.textContent = `
+        #c7-floor-total-widget{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;background:rgba(18,26,43,.86);border:1px solid rgba(255,255,255,.08);padding:10px 12px;border-radius:14px;margin:0 0 14px 0;box-shadow:0 18px 50px rgba(0,0,0,.22)}
+        #c7-floor-total-widget .c7ft-title{font-size:12px;color:#91a0b8;font-weight:800;display:flex;align-items:center;margin-right:2px;min-width:130px}
+        #c7-floor-total-widget .c7ft-card{background:#0e1727;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:9px 11px;min-width:136px;flex:1}
+        #c7-floor-total-widget .c7ft-card b{display:block;font-size:20px;line-height:1.1;color:#f5f7fb}
+        #c7-floor-total-widget .c7ft-card span{display:block;margin-top:4px;color:#91a0b8;font-size:11px;line-height:1.35}
+        #c7-floor-total-widget .c7ft-card .c7ft-label{font-size:11px;font-weight:900;color:#dce7ff;margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em}
+        #c7-floor-total-widget .c7ft-card.warn b{color:#ff9f43}
+        #c7-floor-total-widget .c7ft-card.critical b{color:#ff5c6c}
+        #c7-floor-total-widget .c7ft-card.callout b{color:#a879ff}
+      `;
+      document.head.appendChild(style);
+    }
+
+    widget = document.createElement('div');
+    widget.id = 'c7-floor-total-widget';
+    widget.innerHTML = '<div class="c7ft-title">Total C7 by floor</div><div class="c7ft-card"><div class="c7ft-label">Waiting</div><b>-</b><span>No Rodeo data yet</span></div>';
+
+    const floorCopyBar = document.querySelector('.floor-copybar');
+    const toolbar = document.querySelector('.toolbar');
+    const cards = document.querySelector('.cards');
+    if (floorCopyBar && floorCopyBar.parentNode) {
+      floorCopyBar.parentNode.insertBefore(widget, floorCopyBar);
+    } else if (toolbar && toolbar.parentNode) {
+      toolbar.parentNode.insertBefore(widget, toolbar.nextSibling);
+    } else if (cards && cards.parentNode) {
+      cards.parentNode.insertBefore(widget, cards.nextSibling);
+    } else {
+      document.body.appendChild(widget);
+    }
+    return widget;
+  }
+
+  function renderFloorTotalsWidget(shipments, sourceRows = 0) {
+    const widget = ensureFloorTotalsWidget();
+    const totals = buildFloorTotals(shipments || []);
+    const allShipments = (shipments || []).length;
+    const allItems = (shipments || []).reduce((sum, shipment) => sum + ((shipment.items || []).length), 0);
+    const allQty = (shipments || []).reduce((sum, shipment) => sum + (Number(shipment.totalQty || 0) || 0), 0);
+    const allCallouts = (shipments || []).filter(shipment => shipment.calloutRisk).length;
+
+    const cards = totals.map(total => {
+      const level = total.callout ? 'callout' : total.critical ? 'critical' : total.warn ? 'warn' : '';
+      const qtyText = total.qty ? ` • Qty ${total.qty}` : '';
+      return `<div class="c7ft-card ${level}"><div class="c7ft-label">${total.label}</div><b>${total.shipments}</b><span>${total.items} C7 row${total.items === 1 ? '' : 's'}${qtyText}<br>${total.callout} callout • Longest ${formatDwell(total.maxDwell)}</span></div>`;
+    }).join('');
+
+    const allQtyText = allQty ? ` • Qty ${allQty}` : '';
+    widget.innerHTML = `<div class="c7ft-title">Total C7 by floor</div>${cards}<div class="c7ft-card"><div class="c7ft-label">All</div><b>${allShipments}</b><span>${allItems} C7 row${allItems === 1 ? '' : 's'}${allQtyText}<br>${allCallouts} callout • ${sourceRows || 0} source rows</span></div>`;
   }
 
   /* ----------------------------- Slack support ---------------------------- */
@@ -837,7 +937,7 @@
       }))
       .sort((a, b) => Number(b.calloutRisk) - Number(a.calloutRisk) || b.maxDwell - a.maxDwell);
 
-    return { shipments, sourceRows: rows.length, verifiedLogin: currentLogin };
+    return { shipments, sourceRows: rows.length, verifiedLogin: currentLogin, floorTotals: buildFloorTotals(shipments) };
   }
 
   function slackKey(shipment) {
@@ -1006,6 +1106,7 @@
           if (response.status < 200 || response.status >= 400) throw new Error(`HTTP ${response.status}`);
           const parsed = parseHTML(response.responseText);
           sendData(parsed);
+          renderFloorTotalsWidget(parsed.shipments, parsed.sourceRows);
           processSlackAlerts(parsed.shipments);
         } catch (error) {
           sendStatus('Unable to read Rodeo data', error.message, 'error');
@@ -1127,6 +1228,65 @@
   // this event fires before its own listener is attached.
   sendHelperPong('startup');
   sendAccess('error', { message: 'Verify Amazon Login', detail: 'Click Verify Amazon Login, wait for the green C7 verified message on Flow Sortation, then return here and press Retry.', actions: ['openFlow', 'retryAccess'] });
+
+
+  // ===== Prince Jacob Custom Update Checker - Every 10 Hours =====
+  function princeUpdateChecker() {
+    const UPDATE_URL = 'https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js';
+    const CHECK_KEY = 'prince_last_update_check_' + ((typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.name) ? GM_info.script.name : 'Condition7DashboardHelper');
+    const CHECK_INTERVAL = 10 * 60 * 60 * 1000; // 10 hours
+
+    const lastCheck = Number(gmGet(CHECK_KEY, 0));
+    const now = Date.now();
+    if (now - lastCheck < CHECK_INTERVAL) return;
+    gmSet(CHECK_KEY, now);
+
+    GM_xmlhttpRequest({
+      method: 'GET',
+      url: UPDATE_URL,
+      nocache: true,
+      timeout: 20_000,
+      onload: response => {
+        const remoteScript = String(response.responseText || '');
+        const remoteMatch = remoteScript.match(/\/\/\s*@version\s+([0-9.]+)/i);
+        if (!remoteMatch) {
+          console.log('[Condition 7 Update Checker] Remote version not found.');
+          return;
+        }
+
+        const remoteVersion = remoteMatch[1];
+        const currentVersion = (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) ? GM_info.script.version : HELPER_VERSION;
+        if (isNewerVersion(remoteVersion, currentVersion)) {
+          const openUpdate = window.confirm(
+            'New Condition 7 Dashboard update available!\n\n' +
+            'Current version: ' + currentVersion + '\n' +
+            'New version: ' + remoteVersion + '\n\n' +
+            'Open update page now?'
+          );
+          if (openUpdate) window.open(UPDATE_URL, '_blank', 'noopener,noreferrer');
+        } else {
+          console.log('[Condition 7 Update Checker] Up to date:', currentVersion);
+        }
+      },
+      onerror: () => console.log('[Condition 7 Update Checker] Failed to check update.'),
+      ontimeout: () => console.log('[Condition 7 Update Checker] Update check timed out.')
+    });
+
+    function isNewerVersion(remote, current) {
+      const r = String(remote).split('.').map(Number);
+      const c = String(current).split('.').map(Number);
+      const len = Math.max(r.length, c.length);
+      for (let i = 0; i < len; i += 1) {
+        const rv = r[i] || 0;
+        const cv = c[i] || 0;
+        if (rv > cv) return true;
+        if (rv < cv) return false;
+      }
+      return false;
+    }
+  }
+
+  princeUpdateChecker();
 
   // Fallback for local/hosted pages that dispatched their ready event before
   // Tampermonkey finished injecting this helper.
