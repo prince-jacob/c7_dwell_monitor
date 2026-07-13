@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.5.1
-// @description  Cloud-authorised Condition 7 dashboard helper with manual Flow verification, 10-hour GitHub update popup, floor C7 totals, Rodeo refresh, and optional Slack alerts.
+// @version      1.5.2
+// @description  Cloud-authorised Condition 7 dashboard helper with manual Flow verification, 10-hour GitHub update popup, all-dwell floor C7 totals, Rodeo refresh, and optional Slack alerts.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
@@ -28,7 +28,7 @@
   'use strict';
 
   const FLOW_IDENTITY_CACHE_KEY = 'condition7FlowIdentityCacheV1';
-  const FLOW_CAPTURE_VERSION = '1.5.1';
+  const FLOW_CAPTURE_VERSION = '1.5.2';
 
   function c7IdentityClean(value) {
     return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -115,7 +115,7 @@
   const DASHBOARD_MARKER = 'meta[name="condition7-dashboard"][content="wprijaco-v1"]';
   if (!document.querySelector(DASHBOARD_MARKER)) return;
 
-  const HELPER_VERSION = '1.5.1';
+  const HELPER_VERSION = '1.5.2';
   const INSTANCE_ATTRIBUTE = 'data-condition7-helper-active';
 
   if (document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)) {
@@ -137,6 +137,11 @@
   const FLOW_IDENTITY_URL = 'https://flow-sortation-eu.amazon.com/NCL1/';
   const TARGET_URL = 'http://rodeo-dub.amazon.com/NCL1/ItemList?_enabledColumns=on&enabledColumns=OUTER_SCANNABLE_ID&enabledColumns=ASIN_TITLES&WorkPool=Scanned&Fracs=NON_FRACS&DwellTimeGreaterThan=0.5&DwellTimeLessThan=2.1333333333333333&ProcessPath=PPPickToRebin4%2cPPPickToRebin2%2cPPPickToRebin3&shipmentType=CUSTOMER_SHIPMENTS';
 
+  // Main dashboard TARGET_URL stays filtered to 30m+ dwell.
+  // This extra URL is ONLY for the small "Total C7 by floor" widget.
+  // It has no DwellTimeGreaterThan filter, so it counts every C7/Scanned row returned by Rodeo, even if dwell is only 1 minute.
+  const ALL_C7_TOTAL_URL = 'https://rodeo-dub.amazon.com/NCL1/ItemList?_enabledColumns=on&WorkPool=Scanned&enabledColumns=ASIN_TITLES&enabledColumns=DEMAND_ID&enabledColumns=OUTER_SCANNABLE_ID&ExSDRange.RangeStartMillis=1783906199999&ExSDRange.RangeEndMillis=1784079060000&ProcessPath=PPPickToRebin4%2CPPPickToRebin2%2CPPPickToRebin3&shipmentType=CUSTOMER_SHIPMENTS';
+
   const STORAGE = {
     slackWebhook: 'condition7StandaloneSlackWebhookV1',
     // New key deliberately starts every v1.4 installation with Slack OFF,
@@ -154,8 +159,10 @@
   let currentLogin = '';
   let currentAccessToken = '';
   let dashboardReady = false;
+  let allC7TotalsRunning = false;
 
   const slackPending = new Set();
+  const escapeHTML = value => String(value || '').replace(/[&<>\"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', "'": '&#39;' }[char]));
   const clean = value => String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
   const normalizeLogin = value => clean(value).toLowerCase().replace(/[^a-z0-9._-]/g, '');
   const normalizeShipmentId = value => {
@@ -626,19 +633,32 @@
 
   /* ----------------------------- Floor totals ----------------------------- */
 
+  function emptyFloorTotal(floor) {
+    const labels = { '2': 'P2R2', '3': 'P2R3', '4': 'P2R4', Other: 'Other' };
+    return {
+      floor,
+      label: labels[floor] || `P${floor}`,
+      shipments: 0,
+      items: 0,
+      qty: 0,
+      callout: 0,
+      maxDwell: 0,
+      shipmentIds: new Set()
+    };
+  }
+
+  // This old builder is kept as fallback only. It uses the 30m+ dashboard data.
   function buildFloorTotals(shipments) {
     const floors = {
-      '2': { floor: '2', label: 'P2', shipments: 0, items: 0, qty: 0, warn: 0, critical: 0, callout: 0, maxDwell: 0 },
-      '3': { floor: '3', label: 'P3', shipments: 0, items: 0, qty: 0, warn: 0, critical: 0, callout: 0, maxDwell: 0 },
-      '4': { floor: '4', label: 'P4', shipments: 0, items: 0, qty: 0, warn: 0, critical: 0, callout: 0, maxDwell: 0 }
+      '2': emptyFloorTotal('2'),
+      '3': emptyFloorTotal('3'),
+      '4': emptyFloorTotal('4')
     };
 
     for (const shipment of shipments || []) {
       const shipmentFloors = [...new Set((shipment.floors || []).map(String).filter(Boolean))];
       for (const floor of shipmentFloors) {
-        if (!floors[floor]) {
-          floors[floor] = { floor, label: floor === 'Other' ? 'Other' : `P${floor}`, shipments: 0, items: 0, qty: 0, warn: 0, critical: 0, callout: 0, maxDwell: 0 };
-        }
+        if (!floors[floor]) floors[floor] = emptyFloorTotal(floor);
 
         const floorItems = (shipment.items || []).filter(item => String(item.floor || '') === floor);
         const itemCount = floorItems.length || (shipmentFloors.length === 1 ? (shipment.items || []).length : 0);
@@ -648,8 +668,6 @@
         floors[floor].items += itemCount;
         floors[floor].qty += qty;
         floors[floor].maxDwell = Math.max(floors[floor].maxDwell, Number(shipment.maxDwell || 0));
-        if (Number(shipment.maxDwell || 0) >= 30) floors[floor].warn += 1;
-        if (Number(shipment.maxDwell || 0) >= 40) floors[floor].critical += 1;
         if (shipment.calloutRisk) floors[floor].callout += 1;
       }
     }
@@ -669,7 +687,7 @@
       style.id = styleId;
       style.textContent = `
         #c7-floor-total-widget{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;background:rgba(18,26,43,.86);border:1px solid rgba(255,255,255,.08);padding:10px 12px;border-radius:14px;margin:0 0 14px 0;box-shadow:0 18px 50px rgba(0,0,0,.22)}
-        #c7-floor-total-widget .c7ft-title{font-size:12px;color:#91a0b8;font-weight:800;display:flex;align-items:center;margin-right:2px;min-width:130px}
+        #c7-floor-total-widget .c7ft-title{font-size:12px;color:#91a0b8;font-weight:800;display:flex;align-items:center;margin-right:2px;min-width:150px;line-height:1.35}
         #c7-floor-total-widget .c7ft-card{background:#0e1727;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:9px 11px;min-width:136px;flex:1}
         #c7-floor-total-widget .c7ft-card b{display:block;font-size:20px;line-height:1.1;color:#f5f7fb}
         #c7-floor-total-widget .c7ft-card span{display:block;margin-top:4px;color:#91a0b8;font-size:11px;line-height:1.35}
@@ -683,7 +701,7 @@
 
     widget = document.createElement('div');
     widget.id = 'c7-floor-total-widget';
-    widget.innerHTML = '<div class="c7ft-title">Total C7 by floor</div><div class="c7ft-card"><div class="c7ft-label">Waiting</div><b>-</b><span>No Rodeo data yet</span></div>';
+    widget.innerHTML = '<div class="c7ft-title">Total C7 by floor<br><span style="font-weight:600;color:#6f7f99">All dwell</span></div><div class="c7ft-card"><div class="c7ft-label">Waiting</div><b>-</b><span>No Rodeo data yet</span></div>';
 
     const floorCopyBar = document.querySelector('.floor-copybar');
     const toolbar = document.querySelector('.toolbar');
@@ -700,22 +718,163 @@
     return widget;
   }
 
-  function renderFloorTotalsWidget(shipments, sourceRows = 0) {
+  function floorLabelFromNumber(floor) {
+    return ({ '2': 'P2R2', '3': 'P2R3', '4': 'P2R4', Other: 'Other' })[floor] || `P${floor}`;
+  }
+
+  function renderFloorTotalsLoading(message = 'Refreshing all C7 floor totals…') {
     const widget = ensureFloorTotalsWidget();
-    const totals = buildFloorTotals(shipments || []);
-    const allShipments = (shipments || []).length;
-    const allItems = (shipments || []).reduce((sum, shipment) => sum + ((shipment.items || []).length), 0);
-    const allQty = (shipments || []).reduce((sum, shipment) => sum + (Number(shipment.totalQty || 0) || 0), 0);
-    const allCallouts = (shipments || []).filter(shipment => shipment.calloutRisk).length;
+    widget.innerHTML = `<div class="c7ft-title">Total C7 by floor<br><span style="font-weight:600;color:#6f7f99">All dwell</span></div><div class="c7ft-card"><div class="c7ft-label">Loading</div><b>…</b><span>${escapeHTML(message)}</span></div>`;
+  }
 
-    const cards = totals.map(total => {
-      const level = total.callout ? 'callout' : total.critical ? 'critical' : total.warn ? 'warn' : '';
+  function renderFloorTotalsError(message, fallbackShipments = [], fallbackRows = 0) {
+    const widget = ensureFloorTotalsWidget();
+    const fallback = buildFloorTotals(fallbackShipments || []);
+    const fallbackCards = fallback.map(total => `<div class="c7ft-card warn"><div class="c7ft-label">${total.label}</div><b>${total.shipments}</b><span>Fallback: 30m+ dwell only<br>${total.items} row${total.items === 1 ? '' : 's'}</span></div>`).join('');
+    widget.innerHTML = `<div class="c7ft-title">Total C7 by floor<br><span style="font-weight:600;color:#ffb86b">All dwell fetch failed</span></div>${fallbackCards}<div class="c7ft-card critical"><div class="c7ft-label">Error</div><b>!</b><span>${escapeHTML(message)}<br>${fallbackRows || 0} fallback source rows</span></div>`;
+  }
+
+  function renderAllC7FloorTotalsWidget(summary) {
+    const widget = ensureFloorTotalsWidget();
+    const floors = summary?.floors || ['2', '3', '4'].map(emptyFloorTotal);
+    const cards = floors.map(total => {
       const qtyText = total.qty ? ` • Qty ${total.qty}` : '';
-      return `<div class="c7ft-card ${level}"><div class="c7ft-label">${total.label}</div><b>${total.shipments}</b><span>${total.items} C7 row${total.items === 1 ? '' : 's'}${qtyText}<br>${total.callout} callout • Longest ${formatDwell(total.maxDwell)}</span></div>`;
+      const dwellText = total.maxDwell ? ` • Longest ${formatDwell(total.maxDwell)}` : '';
+      return `<div class="c7ft-card"><div class="c7ft-label">${escapeHTML(total.label || floorLabelFromNumber(total.floor))}</div><b>${Number(total.shipments || 0)}</b><span>${Number(total.items || 0)} C7 row${Number(total.items || 0) === 1 ? '' : 's'}${qtyText}<br>All dwell${dwellText}</span></div>`;
     }).join('');
+    const allQtyText = summary?.allQty ? ` • Qty ${summary.allQty}` : '';
+    const refreshed = summary?.loadedAt ? new Date(summary.loadedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+    widget.innerHTML = `<div class="c7ft-title">Total C7 by floor<br><span style="font-weight:600;color:#6f7f99">All dwell / Scanned</span></div>${cards}<div class="c7ft-card"><div class="c7ft-label">All floors</div><b>${Number(summary?.allShipments || 0)}</b><span>${Number(summary?.allItems || 0)} C7 row${Number(summary?.allItems || 0) === 1 ? '' : 's'}${allQtyText}<br>${Number(summary?.sourceRows || 0)} source rows${refreshed ? ` • ${refreshed}` : ''}</span></div>`;
+  }
 
-    const allQtyText = allQty ? ` • Qty ${allQty}` : '';
-    widget.innerHTML = `<div class="c7ft-title">Total C7 by floor</div>${cards}<div class="c7ft-card"><div class="c7ft-label">All</div><b>${allShipments}</b><span>${allItems} C7 row${allItems === 1 ? '' : 's'}${allQtyText}<br>${allCallouts} callout • ${sourceRows || 0} source rows</span></div>`;
+  // Parse the separate "all C7" ItemList. This is deliberately more flexible than parseHTML():
+  // it does not require Dwell Time or Condition columns. The all-C7 URL is already WorkPool=Scanned,
+  // so if Rodeo does not include a Condition column we still count the returned rows.
+  function parseAllC7FloorTotals(html) {
+    const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+    const table = doc.querySelector('table.result-table');
+    if (!table) {
+      throw new Error(/midway|sign in|login|authentication/i.test(doc.body?.innerText || '')
+        ? 'Authentication page received. Open Rodeo and sign in first.'
+        : 'Rodeo all-C7 result table not found.');
+    }
+
+    const map = columnMap(table);
+    const I = {
+      shipment: idx(map, ['Shipment ID', 'Shipment', 'Demand ID']),
+      condition: idx(map, ['Condition']),
+      expected: idx(map, ['Expected Ship Date']),
+      dwell: idx(map, ['Dwell Time', 'Dwell Time (hours)']),
+      process: idx(map, ['Process Path']),
+      qty: idx(map, ['Quantity', 'Qty'])
+    };
+
+    const floors = { '2': emptyFloorTotal('2'), '3': emptyFloorTotal('3'), '4': emptyFloorTotal('4') };
+    const allShipmentIds = new Set();
+    const rows = [...table.querySelectorAll('tbody tr')];
+    let countedRows = 0;
+    let allQty = 0;
+
+    for (const row of rows) {
+      const cells = [...row.children];
+      if (!cells.length) continue;
+
+      const rowText = clean(row.innerText || '');
+      if (!rowText) continue;
+
+      // If Rodeo provides Condition, enforce Condition 7. If it doesn't, trust the WorkPool=Scanned all-C7 link.
+      if (I.condition >= 0) {
+        const condition = Number(txt(cells, I.condition));
+        if (condition !== 7) continue;
+      }
+
+      const processPath = txt(cells, I.process) || rowText;
+      const floor = (processPath.match(/PPPickToRebin([234])/i) || [])[1] || 'Other';
+      if (!floors[floor]) floors[floor] = emptyFloorTotal(floor);
+
+      const shipmentId = normalizeShipmentId(txt(cells, I.shipment)) || `row-${countedRows + 1}`;
+      const qty = Number(txt(cells, I.qty)) || 0;
+      const dwell = I.dwell >= 0 ? parseDwell(txt(cells, I.dwell)) : 0;
+
+      floors[floor].items += 1;
+      floors[floor].qty += qty;
+      floors[floor].maxDwell = Math.max(floors[floor].maxDwell, dwell);
+      floors[floor].shipmentIds.add(shipmentId);
+      allShipmentIds.add(shipmentId);
+      allQty += qty;
+      countedRows += 1;
+    }
+
+    const floorList = [...['2', '3', '4'], ...Object.keys(floors).filter(f => !['2', '3', '4'].includes(f)).sort()]
+      .map(floor => {
+        const total = floors[floor];
+        return {
+          floor: total.floor,
+          label: total.label || floorLabelFromNumber(floor),
+          shipments: total.shipmentIds.size || total.shipments || 0,
+          items: total.items,
+          qty: total.qty,
+          maxDwell: total.maxDwell
+        };
+      });
+
+    return {
+      floors: floorList,
+      allShipments: allShipmentIds.size,
+      allItems: countedRows,
+      allQty,
+      sourceRows: rows.length,
+      countedRows,
+      loadedAt: Date.now()
+    };
+  }
+
+  function fetchAllC7FloorTotals(fallbackParsed = null) {
+    if (!accessApproved || allC7TotalsRunning) return;
+    allC7TotalsRunning = true;
+    renderFloorTotalsLoading('Fetching all C7 rows from Rodeo, not only 30m+ dwell.');
+
+    GM_xmlhttpRequest({
+      method: 'GET',
+      url: ALL_C7_TOTAL_URL,
+      anonymous: false,
+      timeout: 45_000,
+      headers: {
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache'
+      },
+      onload: response => {
+        try {
+          if (response.status < 200 || response.status >= 400) throw new Error(`HTTP ${response.status}`);
+          if (looksLikeAuthenticationPage(response)) throw new Error('Authentication page received. Open Rodeo and sign in first.');
+          const summary = parseAllC7FloorTotals(response.responseText);
+          renderAllC7FloorTotalsWidget(summary);
+        } catch (error) {
+          console.error('[Condition 7 Standalone] All C7 floor totals failed:', error);
+          renderFloorTotalsError(error.message, fallbackParsed?.shipments || [], fallbackParsed?.sourceRows || 0);
+        } finally {
+          allC7TotalsRunning = false;
+        }
+      },
+      onerror: () => {
+        allC7TotalsRunning = false;
+        renderFloorTotalsError('All-C7 totals request failed. Check network, Midway and Rodeo login.', fallbackParsed?.shipments || [], fallbackParsed?.sourceRows || 0);
+      },
+      ontimeout: () => {
+        allC7TotalsRunning = false;
+        renderFloorTotalsError('All-C7 totals request timed out.', fallbackParsed?.shipments || [], fallbackParsed?.sourceRows || 0);
+      }
+    });
+  }
+
+  // Backward-compatible renderer name used by older error/clear paths.
+  function renderFloorTotalsWidget(shipments, sourceRows = 0) {
+    if (!shipments || !shipments.length) {
+      const widget = ensureFloorTotalsWidget();
+      widget.innerHTML = '<div class="c7ft-title">Total C7 by floor<br><span style="font-weight:600;color:#6f7f99">All dwell</span></div><div class="c7ft-card"><div class="c7ft-label">Waiting</div><b>-</b><span>No all-C7 data yet</span></div>';
+      return;
+    }
+    renderFloorTotalsError('Showing fallback 30m+ dwell data until all-C7 totals load.', shipments, sourceRows);
   }
 
   /* ----------------------------- Slack support ---------------------------- */
@@ -1106,7 +1265,7 @@
           if (response.status < 200 || response.status >= 400) throw new Error(`HTTP ${response.status}`);
           const parsed = parseHTML(response.responseText);
           sendData(parsed);
-          renderFloorTotalsWidget(parsed.shipments, parsed.sourceRows);
+          fetchAllC7FloorTotals(parsed);
           processSlackAlerts(parsed.shipments);
         } catch (error) {
           sendStatus('Unable to read Rodeo data', error.message, 'error');
