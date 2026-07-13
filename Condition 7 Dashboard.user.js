@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.5.2
-// @description  Cloud-authorised Condition 7 dashboard helper with manual Flow verification, 10-hour GitHub update popup, all-dwell floor C7 totals, Rodeo refresh, and optional Slack alerts.
+// @version      1.5.3
+// @description  Cloud-authorised Condition 7 dashboard helper with manual Flow verification, 10-hour GitHub update popup, ExSD Scanned floor C7 totals, Rodeo refresh, and optional Slack alerts.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
@@ -28,7 +28,7 @@
   'use strict';
 
   const FLOW_IDENTITY_CACHE_KEY = 'condition7FlowIdentityCacheV1';
-  const FLOW_CAPTURE_VERSION = '1.5.2';
+  const FLOW_CAPTURE_VERSION = '1.5.3';
 
   function c7IdentityClean(value) {
     return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -115,7 +115,7 @@
   const DASHBOARD_MARKER = 'meta[name="condition7-dashboard"][content="wprijaco-v1"]';
   if (!document.querySelector(DASHBOARD_MARKER)) return;
 
-  const HELPER_VERSION = '1.5.2';
+  const HELPER_VERSION = '1.5.3';
   const INSTANCE_ATTRIBUTE = 'data-condition7-helper-active';
 
   if (document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)) {
@@ -139,8 +139,9 @@
 
   // Main dashboard TARGET_URL stays filtered to 30m+ dwell.
   // This extra URL is ONLY for the small "Total C7 by floor" widget.
-  // It has no DwellTimeGreaterThan filter, so it counts every C7/Scanned row returned by Rodeo, even if dwell is only 1 minute.
-  const ALL_C7_TOTAL_URL = 'https://rodeo-dub.amazon.com/NCL1/ItemList?_enabledColumns=on&WorkPool=Scanned&enabledColumns=ASIN_TITLES&enabledColumns=DEMAND_ID&enabledColumns=OUTER_SCANNABLE_ID&ExSDRange.RangeStartMillis=1783906199999&ExSDRange.RangeEndMillis=1784079060000&ProcessPath=PPPickToRebin4%2CPPPickToRebin2%2CPPPickToRebin3&shipmentType=CUSTOMER_SHIPMENTS';
+  // It fetches Rodeo ExSD summary and reads the Scanned table totals directly.
+  // This avoids the ItemList 1000-row cap and matches Rodeo's own floor totals.
+  const EXSD_SCANNED_TOTAL_URL = 'https://rodeo-dub.amazon.com/NCL1/ExSD?yAxis=PROCESS_PATH&zAxis=WORK_POOL&shipmentTypes=ALL&exSDRange.quickRange=ALL&exSDRange.dailyStart=18%3A00&exSDRange.dailyEnd=06%3A00&giftOption=ALL&fulfillmentServiceClass=ALL&fracs=ALL&isEulerExSDMiss=ALL&isEulerPromiseMiss=ALL&isEulerUpgraded=ALL&isReactiveTransfer=ALL&workPool=Scanned&_workPool=on&processPath=PPPickToRebin2&processPath=PPPickToRebin3&processPath=PPPickToRebin4&processPath=&minPickPriority=MIN_PRIORITY&shipMethod=&shipOption=&sortCode=&fnSku=';
 
   const STORAGE = {
     slackWebhook: 'condition7StandaloneSlackWebhookV1',
@@ -737,94 +738,106 @@
   function renderAllC7FloorTotalsWidget(summary) {
     const widget = ensureFloorTotalsWidget();
     const floors = summary?.floors || ['2', '3', '4'].map(emptyFloorTotal);
+    const sourceLabel = summary?.source === 'exsd-scanned-table' ? 'Rodeo ExSD Scanned table' : 'All dwell / Scanned';
     const cards = floors.map(total => {
+      const count = Number(total.total ?? total.items ?? total.shipments ?? 0);
+      const detail = summary?.source === 'exsd-scanned-table'
+        ? 'Rodeo Scanned total'
+        : `${Number(total.items || 0)} C7 row${Number(total.items || 0) === 1 ? '' : 's'}`;
       const qtyText = total.qty ? ` • Qty ${total.qty}` : '';
       const dwellText = total.maxDwell ? ` • Longest ${formatDwell(total.maxDwell)}` : '';
-      return `<div class="c7ft-card"><div class="c7ft-label">${escapeHTML(total.label || floorLabelFromNumber(total.floor))}</div><b>${Number(total.shipments || 0)}</b><span>${Number(total.items || 0)} C7 row${Number(total.items || 0) === 1 ? '' : 's'}${qtyText}<br>All dwell${dwellText}</span></div>`;
+      return `<div class="c7ft-card"><div class="c7ft-label">${escapeHTML(total.label || floorLabelFromNumber(total.floor))}</div><b>${count}</b><span>${detail}${qtyText}<br>All dwell${dwellText}</span></div>`;
     }).join('');
+    const grandTotal = Number(summary?.grandTotal ?? summary?.allItems ?? summary?.allShipments ?? 0);
     const allQtyText = summary?.allQty ? ` • Qty ${summary.allQty}` : '';
     const refreshed = summary?.loadedAt ? new Date(summary.loadedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-    widget.innerHTML = `<div class="c7ft-title">Total C7 by floor<br><span style="font-weight:600;color:#6f7f99">All dwell / Scanned</span></div>${cards}<div class="c7ft-card"><div class="c7ft-label">All floors</div><b>${Number(summary?.allShipments || 0)}</b><span>${Number(summary?.allItems || 0)} C7 row${Number(summary?.allItems || 0) === 1 ? '' : 's'}${allQtyText}<br>${Number(summary?.sourceRows || 0)} source rows${refreshed ? ` • ${refreshed}` : ''}</span></div>`;
+    const bottomText = summary?.source === 'exsd-scanned-table'
+      ? `No 1000-row cap${refreshed ? ` • ${refreshed}` : ''}`
+      : `${Number(summary?.sourceRows || 0)} source rows${refreshed ? ` • ${refreshed}` : ''}`;
+    widget.innerHTML = `<div class="c7ft-title">Total C7 by floor<br><span style="font-weight:600;color:#6f7f99">${escapeHTML(sourceLabel)}</span></div>${cards}<div class="c7ft-card"><div class="c7ft-label">All floors</div><b>${grandTotal}</b><span>${grandTotal} C7 total${allQtyText}<br>${bottomText}</span></div>`;
   }
 
-  // Parse the separate "all C7" ItemList. This is deliberately more flexible than parseHTML():
-  // it does not require Dwell Time or Condition columns. The all-C7 URL is already WorkPool=Scanned,
-  // so if Rodeo does not include a Condition column we still count the returned rows.
-  function parseAllC7FloorTotals(html) {
+  // Parse Rodeo ExSD summary instead of ItemList rows.
+  // The old ItemList method can stop at 1000 rows, but the ExSD Scanned table shows
+  // the full Rodeo totals by PPPickToRebin2/3/4.
+  function parseExsdScannedFloorTotals(html) {
     const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
-    const table = doc.querySelector('table.result-table');
-    if (!table) {
-      throw new Error(/midway|sign in|login|authentication/i.test(doc.body?.innerText || '')
-        ? 'Authentication page received. Open Rodeo and sign in first.'
-        : 'Rodeo all-C7 result table not found.');
+    const bodyText = clean(doc.body?.innerText || '');
+    if (/midway|sign in|login|authentication|are you a robot|captcha/i.test(bodyText)) {
+      throw new Error('Authentication/CAPTCHA page received. Open Rodeo and complete login first.');
     }
 
-    const map = columnMap(table);
-    const I = {
-      shipment: idx(map, ['Shipment ID', 'Shipment', 'Demand ID']),
-      condition: idx(map, ['Condition']),
-      expected: idx(map, ['Expected Ship Date']),
-      dwell: idx(map, ['Dwell Time', 'Dwell Time (hours)']),
-      process: idx(map, ['Process Path']),
-      qty: idx(map, ['Quantity', 'Qty'])
+    let table = doc.querySelector('#ScannedTable');
+    if (!table) {
+      const titles = [...doc.querySelectorAll('span.process-path-title')];
+      const scannedTitle = titles.find(span => clean(span.textContent).toLowerCase() === 'scanned');
+      table = scannedTitle ? scannedTitle.nextElementSibling?.querySelector?.('table.result-table') || scannedTitle.parentElement?.nextElementSibling?.querySelector?.('table.result-table') || scannedTitle.parentElement?.parentElement?.querySelector?.('table.result-table') : null;
+    }
+    if (!table) {
+      table = [...doc.querySelectorAll('table.result-table')].find(t => /PPPickToRebin[234]/i.test(t.innerText || '') && /Scanned/i.test((t.id || '') + ' ' + (t.previousElementSibling?.innerText || '')));
+    }
+    if (!table) throw new Error('Rodeo Scanned ExSD table not found. Open the ExSD page and check Rodeo loaded correctly.');
+
+    const rows = [...table.querySelectorAll('tr')];
+    const headerRow = rows.find(row => [...row.children].some(cell => /^total$/i.test(clean(cell.textContent))));
+    const headerCells = headerRow ? [...headerRow.children] : [];
+    let totalIndex = headerCells.findIndex(cell => /^total$/i.test(clean(cell.textContent)));
+    if (totalIndex < 0) totalIndex = 1;
+
+    const parseCount = value => {
+      const text = clean(value).replace(/,/g, '');
+      const match = text.match(/-?\d+\b/);
+      return match ? Number(match[0]) : 0;
     };
 
     const floors = { '2': emptyFloorTotal('2'), '3': emptyFloorTotal('3'), '4': emptyFloorTotal('4') };
-    const allShipmentIds = new Set();
-    const rows = [...table.querySelectorAll('tbody tr')];
-    let countedRows = 0;
-    let allQty = 0;
+    let grandTotal = 0;
+    let matchedFloorRows = 0;
 
     for (const row of rows) {
+      if (row === headerRow) continue;
       const cells = [...row.children];
       if (!cells.length) continue;
+      const rowLabel = clean(cells[0]?.textContent || '');
+      const value = parseCount(cells[totalIndex]?.textContent || '');
 
-      const rowText = clean(row.innerText || '');
-      if (!rowText) continue;
-
-      // If Rodeo provides Condition, enforce Condition 7. If it doesn't, trust the WorkPool=Scanned all-C7 link.
-      if (I.condition >= 0) {
-        const condition = Number(txt(cells, I.condition));
-        if (condition !== 7) continue;
+      const floorMatch = rowLabel.match(/PPPickToRebin([234])/i);
+      if (floorMatch) {
+        const floor = floorMatch[1];
+        floors[floor].total = value;
+        floors[floor].items = value;
+        floors[floor].shipments = value;
+        matchedFloorRows += 1;
+        continue;
       }
 
-      const processPath = txt(cells, I.process) || rowText;
-      const floor = (processPath.match(/PPPickToRebin([234])/i) || [])[1] || 'Other';
-      if (!floors[floor]) floors[floor] = emptyFloorTotal(floor);
-
-      const shipmentId = normalizeShipmentId(txt(cells, I.shipment)) || `row-${countedRows + 1}`;
-      const qty = Number(txt(cells, I.qty)) || 0;
-      const dwell = I.dwell >= 0 ? parseDwell(txt(cells, I.dwell)) : 0;
-
-      floors[floor].items += 1;
-      floors[floor].qty += qty;
-      floors[floor].maxDwell = Math.max(floors[floor].maxDwell, dwell);
-      floors[floor].shipmentIds.add(shipmentId);
-      allShipmentIds.add(shipmentId);
-      allQty += qty;
-      countedRows += 1;
+      if (/^total$/i.test(rowLabel)) {
+        grandTotal = value;
+      }
     }
 
-    const floorList = [...['2', '3', '4'], ...Object.keys(floors).filter(f => !['2', '3', '4'].includes(f)).sort()]
-      .map(floor => {
-        const total = floors[floor];
-        return {
-          floor: total.floor,
-          label: total.label || floorLabelFromNumber(floor),
-          shipments: total.shipmentIds.size || total.shipments || 0,
-          items: total.items,
-          qty: total.qty,
-          maxDwell: total.maxDwell
-        };
-      });
+    if (!matchedFloorRows) throw new Error('Scanned table found, but PPPickToRebin2/3/4 rows were not found.');
+    if (!grandTotal) grandTotal = ['2', '3', '4'].reduce((sum, floor) => sum + Number(floors[floor].total || 0), 0);
+
+    const floorList = ['2', '3', '4'].map(floor => ({
+      floor,
+      label: floorLabelFromNumber(floor),
+      total: Number(floors[floor].total || 0),
+      items: Number(floors[floor].items || 0),
+      shipments: Number(floors[floor].shipments || 0),
+      qty: 0,
+      maxDwell: 0
+    }));
 
     return {
+      source: 'exsd-scanned-table',
       floors: floorList,
-      allShipments: allShipmentIds.size,
-      allItems: countedRows,
-      allQty,
+      grandTotal,
+      allItems: grandTotal,
+      allShipments: grandTotal,
+      allQty: 0,
       sourceRows: rows.length,
-      countedRows,
+      countedRows: matchedFloorRows,
       loadedAt: Date.now()
     };
   }
@@ -832,11 +845,11 @@
   function fetchAllC7FloorTotals(fallbackParsed = null) {
     if (!accessApproved || allC7TotalsRunning) return;
     allC7TotalsRunning = true;
-    renderFloorTotalsLoading('Fetching all C7 rows from Rodeo, not only 30m+ dwell.');
+    renderFloorTotalsLoading('Fetching Rodeo ExSD Scanned summary. This avoids the 1000-row ItemList cap.');
 
     GM_xmlhttpRequest({
       method: 'GET',
-      url: ALL_C7_TOTAL_URL,
+      url: EXSD_SCANNED_TOTAL_URL,
       anonymous: false,
       timeout: 45_000,
       headers: {
@@ -847,7 +860,7 @@
         try {
           if (response.status < 200 || response.status >= 400) throw new Error(`HTTP ${response.status}`);
           if (looksLikeAuthenticationPage(response)) throw new Error('Authentication page received. Open Rodeo and sign in first.');
-          const summary = parseAllC7FloorTotals(response.responseText);
+          const summary = parseExsdScannedFloorTotals(response.responseText);
           renderAllC7FloorTotalsWidget(summary);
         } catch (error) {
           console.error('[Condition 7 Standalone] All C7 floor totals failed:', error);
@@ -858,11 +871,11 @@
       },
       onerror: () => {
         allC7TotalsRunning = false;
-        renderFloorTotalsError('All-C7 totals request failed. Check network, Midway and Rodeo login.', fallbackParsed?.shipments || [], fallbackParsed?.sourceRows || 0);
+        renderFloorTotalsError('ExSD Scanned totals request failed. Check network, Midway and Rodeo login.', fallbackParsed?.shipments || [], fallbackParsed?.sourceRows || 0);
       },
       ontimeout: () => {
         allC7TotalsRunning = false;
-        renderFloorTotalsError('All-C7 totals request timed out.', fallbackParsed?.shipments || [], fallbackParsed?.sourceRows || 0);
+        renderFloorTotalsError('ExSD Scanned totals request timed out.', fallbackParsed?.shipments || [], fallbackParsed?.sourceRows || 0);
       }
     });
   }
@@ -871,7 +884,7 @@
   function renderFloorTotalsWidget(shipments, sourceRows = 0) {
     if (!shipments || !shipments.length) {
       const widget = ensureFloorTotalsWidget();
-      widget.innerHTML = '<div class="c7ft-title">Total C7 by floor<br><span style="font-weight:600;color:#6f7f99">All dwell</span></div><div class="c7ft-card"><div class="c7ft-label">Waiting</div><b>-</b><span>No all-C7 data yet</span></div>';
+      widget.innerHTML = '<div class="c7ft-title">Total C7 by floor<br><span style="font-weight:600;color:#6f7f99">All dwell</span></div><div class="c7ft-card"><div class="c7ft-label">Waiting</div><b>-</b><span>No ExSD Scanned data yet</span></div>';
       return;
     }
     renderFloorTotalsError('Showing fallback 30m+ dwell data until all-C7 totals load.', shipments, sourceRows);
