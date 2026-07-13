@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.5.3
-// @description  Cloud-authorised Condition 7 dashboard helper with manual Flow verification, 10-hour GitHub update popup, ExSD Scanned floor C7 totals, Rodeo refresh, and optional Slack alerts.
+// @version      1.5.4
+// @description  Cloud-authorised Condition 7 dashboard helper with manual Flow verification, 10-hour GitHub update popup, fixed ExSD Scanned floor C7 totals, Rodeo refresh, and optional Slack alerts.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
@@ -28,7 +28,7 @@
   'use strict';
 
   const FLOW_IDENTITY_CACHE_KEY = 'condition7FlowIdentityCacheV1';
-  const FLOW_CAPTURE_VERSION = '1.5.3';
+  const FLOW_CAPTURE_VERSION = '1.5.4';
 
   function c7IdentityClean(value) {
     return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -115,7 +115,7 @@
   const DASHBOARD_MARKER = 'meta[name="condition7-dashboard"][content="wprijaco-v1"]';
   if (!document.querySelector(DASHBOARD_MARKER)) return;
 
-  const HELPER_VERSION = '1.5.3';
+  const HELPER_VERSION = '1.5.4';
   const INSTANCE_ATTRIBUTE = 'data-condition7-helper-active';
 
   if (document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)) {
@@ -786,7 +786,8 @@
 
     const parseCount = value => {
       const text = clean(value).replace(/,/g, '');
-      const match = text.match(/-?\d+\b/);
+      // v1.5.4 fix: use a plain digit regex. v1.5.3 had a hidden backspace char before \d, so all ExSD totals parsed as 0.
+      const match = text.match(/-?\d+/);
       return match ? Number(match[0]) : 0;
     };
 
