@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.6.0
-// @description  Firebase-authorised Condition 7 dashboard helper with background Flow /permissions verification, manual fallback, GitHub update popup, ExSD Scanned floor C7 totals, Rodeo refresh, and optional Slack alerts.
+// @version      1.6.1
+// @description  Firebase Spark/free Condition 7 dashboard helper with direct Firestore allowlist, Flow /permissions verification, GitHub update popup, ExSD Scanned floor totals, Rodeo refresh, and optional Slack alerts.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
@@ -20,7 +20,7 @@
 // @connect      p2rc7dwell.thejacobslab.com
 // @connect      *.web.app
 // @connect      *.firebaseapp.com
-// @connect      *.cloudfunctions.net
+// @connect      firestore.googleapis.com
 // @connect      raw.githubusercontent.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -33,7 +33,7 @@
   'use strict';
 
   const FLOW_IDENTITY_CACHE_KEY = 'condition7FlowIdentityCacheV1';
-  const FLOW_CAPTURE_VERSION = '1.6.0';
+  const FLOW_CAPTURE_VERSION = '1.6.1';
 
   function c7IdentityClean(value) {
     return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -120,7 +120,7 @@
   const DASHBOARD_MARKER = 'meta[name="condition7-dashboard"][content="wprijaco-v1"]';
   if (!document.querySelector(DASHBOARD_MARKER)) return;
 
-  const HELPER_VERSION = '1.6.0';
+  const HELPER_VERSION = '1.6.1';
   const INSTANCE_ATTRIBUTE = 'data-condition7-helper-active';
 
   if (document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)) {
@@ -129,14 +129,11 @@
   }
   document.documentElement.setAttribute(INSTANCE_ATTRIBUTE, HELPER_VERSION);
 
-  // Approved users are checked by Firebase Cloud Function + Firestore, not inside this script.
-  // When the dashboard is hosted on Firebase, /api/checkC7Access is rewritten to the function.
-  // Replace YOUR_FIREBASE_PROJECT_ID only if you still test from file:// before hosting.
+  // Spark/free Firebase version:
+  // Approved users are checked directly from Firestore REST, not through Cloud Functions.
+  // This avoids the Blaze requirement. Do not store private notes/secrets in allowedUsers docs.
   const FIREBASE_PROJECT_ID = 'p2rc7-c00a3';
-  const FIREBASE_FALLBACK_ORIGIN = `https://${FIREBASE_PROJECT_ID}.web.app`;
-  const ACCESS_API_URL = location.protocol === 'file:'
-    ? `${FIREBASE_FALLBACK_ORIGIN}/api/checkC7Access`
-    : `${location.origin}/api/checkC7Access`;
+  const FIRESTORE_ALLOWED_USERS_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/databases/(default)/documents/allowedUsers`;
 
   const REFRESH_MS = 60_000;
   const ACCESS_RECHECK_MS = 15 * 60_000;
@@ -206,52 +203,109 @@
     }
   }
 
+  function firestoreValueToJS(value) {
+    if (!value || typeof value !== 'object') return undefined;
+    if (Object.prototype.hasOwnProperty.call(value, 'stringValue')) return String(value.stringValue || '');
+    if (Object.prototype.hasOwnProperty.call(value, 'booleanValue')) return Boolean(value.booleanValue);
+    if (Object.prototype.hasOwnProperty.call(value, 'integerValue')) return Number(value.integerValue || 0);
+    if (Object.prototype.hasOwnProperty.call(value, 'doubleValue')) return Number(value.doubleValue || 0);
+    if (Object.prototype.hasOwnProperty.call(value, 'timestampValue')) return String(value.timestampValue || '');
+    if (Object.prototype.hasOwnProperty.call(value, 'nullValue')) return null;
+    if (value.mapValue && value.mapValue.fields) return firestoreFieldsToJS(value.mapValue.fields);
+    if (value.arrayValue && Array.isArray(value.arrayValue.values)) return value.arrayValue.values.map(firestoreValueToJS);
+    return undefined;
+  }
+
+  function firestoreFieldsToJS(fields) {
+    const out = {};
+    Object.entries(fields || {}).forEach(([key, value]) => {
+      out[key] = firestoreValueToJS(value);
+    });
+    return out;
+  }
+
+  function isFirestoreExpiryExpired(expiresAt) {
+    if (!expiresAt) return false;
+    const ms = Date.parse(String(expiresAt));
+    if (!Number.isFinite(ms)) return false;
+    return ms <= Date.now();
+  }
+
   function authorizeLoginWithCloud(login, context, callback) {
     const safeLogin = normalizeLogin(login);
     if (!safeLogin) {
-      callback(new Error('No Amazon login was available for cloud verification'));
+      callback(new Error('No Amazon login was available for Firestore verification'));
       return;
     }
 
-    const payload = {
-      login: safeLogin,
-      source: context?.source || 'flow-cache',
-      checkedAt: context?.checkedAt || Date.now(),
-      helperVersion: HELPER_VERSION,
-      dashboardOrigin: location.origin,
-      dashboardHost: location.hostname,
-      flowPermissionsValid: Boolean(context?.permissionsValid),
-      flowPermissionKeys: Array.isArray(context?.permissionKeys) ? context.permissionKeys.slice(0, 50) : []
-    };
+    const url = `${FIRESTORE_ALLOWED_USERS_BASE}/${encodeURIComponent(safeLogin)}?c7=${Date.now()}`;
 
     GM_xmlhttpRequest({
-      method: 'POST',
-      url: ACCESS_API_URL,
-      anonymous: false,
+      method: 'GET',
+      url,
+      anonymous: true,
       timeout: 15_000,
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json'
-      },
-      data: JSON.stringify(payload),
+      headers: { Accept: 'application/json' },
       onload: response => {
         let data = null;
         try {
           data = JSON.parse(String(response.responseText || '{}'));
         } catch (error) {
-          callback(new Error(`Firebase access API returned invalid JSON. HTTP ${response.status || 'unknown'}`));
+          callback(new Error(`Firestore allowlist returned invalid JSON. HTTP ${response.status || 'unknown'}`));
+          return;
+        }
+
+        if (response.status === 404) {
+          callback(null, {
+            allowed: false,
+            login: safeLogin,
+            message: `${safeLogin} is not in the Firebase Firestore allowlist.`
+          });
+          return;
+        }
+
+        if (response.status === 403) {
+          callback(new Error('Firestore blocked the allowlist read. Deploy firestore.rules and make sure Firestore database is created.'));
           return;
         }
 
         if (response.status && (response.status < 200 || response.status >= 300)) {
-          callback(new Error(data.message || `Firebase access API returned HTTP ${response.status}`), data);
+          callback(new Error(data.error?.message || `Firestore allowlist returned HTTP ${response.status}`), data);
           return;
         }
 
-        callback(null, data);
+        const user = firestoreFieldsToJS(data.fields || {});
+        const enabled = user.enabled === true || String(user.enabled).toLowerCase() === 'true';
+        const expired = isFirestoreExpiryExpired(user.expiresAt);
+
+        if (!enabled) {
+          callback(null, {
+            allowed: false,
+            login: safeLogin,
+            message: `${safeLogin} is disabled in the Firebase Firestore allowlist.`
+          });
+          return;
+        }
+
+        if (expired) {
+          callback(null, {
+            allowed: false,
+            login: safeLogin,
+            message: `${safeLogin} access has expired in Firebase Firestore.`
+          });
+          return;
+        }
+
+        callback(null, {
+          allowed: true,
+          login: safeLogin,
+          role: user.role || 'viewer',
+          expiresAt: user.expiresAt || '',
+          message: 'Approved by Firebase Firestore allowlist.'
+        });
       },
-      onerror: () => callback(new Error('Firebase access API request failed. Check Firebase deploy, HTTPS, hosting rewrite, and @connect permission.')),
-      ontimeout: () => callback(new Error('Firebase access API timed out after 15 seconds.'))
+      onerror: () => callback(new Error('Firestore allowlist request failed. Check Firestore setup, HTTPS, and @connect firestore.googleapis.com permission.')),
+      ontimeout: () => callback(new Error('Firestore allowlist request timed out after 15 seconds.'))
     });
   }
 
@@ -263,10 +317,10 @@
 
     sendAccess('checking', {
       login: cached.login,
-      message: 'Checking Firebase access…',
-      detail: `Amazon login ${cached.login} was verified from Flow Sortation. Checking Firebase allowlist now.`
+      message: 'Checking Firebase Firestore access…',
+      detail: `Amazon login ${cached.login} was verified from Flow Sortation. Checking Firebase Firestore allowlist now.`
     });
-    sendStatus('Checking Firebase access…', `Verifying ${cached.login} with Firebase allowlist`);
+    sendStatus('Checking Firebase Firestore access…', `Verifying ${cached.login} with Firebase Firestore allowlist`);
 
     authorizeLoginWithCloud(cached.login, cached, (error, result) => {
       if (error) {
@@ -275,10 +329,10 @@
         stopMonitoring(true);
         sendAccess('error', {
           login: cached.login,
-          message: 'Firebase access check failed',
+          message: 'Firebase Firestore access check failed',
           detail: error.message || String(error)
         });
-        sendStatus('Firebase access check failed', error.message || String(error), 'error');
+        sendStatus('Firebase Firestore access check failed', error.message || String(error), 'error');
         return;
       }
 
@@ -289,21 +343,21 @@
         sendAccess('denied', {
           login: cached.login,
           message: 'Access denied',
-          detail: result?.message || `${cached.login} is not authorised by the Firebase allowlist.`
+          detail: result?.message || `${cached.login} is not authorised by the Firebase Firestore allowlist.`
         });
-        sendStatus('Access denied', `${cached.login} is not approved on the Firebase allowlist`, 'error');
+        sendStatus('Access denied', `${cached.login} is not approved on the Firebase Firestore allowlist`, 'error');
         return;
       }
 
       accessApproved = true;
-      currentAccessToken = String(result.token || '');
+      currentAccessToken = '';
       currentLogin = normalizeLogin(result.login || cached.login);
       sendAccess('approved', {
         login: currentLogin,
         message: `Access approved for ${currentLogin}`,
         detail: result.expiresAt
-          ? `Firebase authorisation valid until ${result.expiresAt}.`
-          : 'Firebase authorisation approved.'
+          ? `Firebase Firestore authorisation valid until ${result.expiresAt}.`
+          : 'Firebase Firestore authorisation approved.'
       });
       sendStatus('Access approved', `Signed in as ${currentLogin}`);
       startMonitoring();
