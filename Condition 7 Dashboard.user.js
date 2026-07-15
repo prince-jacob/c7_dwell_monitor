@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.5.4
-// @description  Cloud-authorised Condition 7 dashboard helper with manual Flow verification, 10-hour GitHub update popup, fixed ExSD Scanned floor C7 totals, Rodeo refresh, and optional Slack alerts.
+// @version      1.6.0
+// @description  Firebase-authorised Condition 7 dashboard helper with background Flow /permissions verification, manual fallback, GitHub update popup, ExSD Scanned floor C7 totals, Rodeo refresh, and optional Slack alerts.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @match        file:///*
 // @match        https://p2rc7dwell.thejacobslab.com/*
+// @match        https://*.web.app/*
+// @match        https://*.firebaseapp.com/*
 // @match        https://flow-sortation-eu.amazon.com/*
 // @connect      flow-sortation-eu.amazon.com
 // @connect      *.amazon.com
@@ -16,6 +18,9 @@
 // @connect      rodeo-dub.amazon.com
 // @connect      hooks.slack.com
 // @connect      p2rc7dwell.thejacobslab.com
+// @connect      *.web.app
+// @connect      *.firebaseapp.com
+// @connect      *.cloudfunctions.net
 // @connect      raw.githubusercontent.com
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -28,7 +33,7 @@
   'use strict';
 
   const FLOW_IDENTITY_CACHE_KEY = 'condition7FlowIdentityCacheV1';
-  const FLOW_CAPTURE_VERSION = '1.5.4';
+  const FLOW_CAPTURE_VERSION = '1.6.0';
 
   function c7IdentityClean(value) {
     return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -115,7 +120,7 @@
   const DASHBOARD_MARKER = 'meta[name="condition7-dashboard"][content="wprijaco-v1"]';
   if (!document.querySelector(DASHBOARD_MARKER)) return;
 
-  const HELPER_VERSION = '1.5.4';
+  const HELPER_VERSION = '1.6.0';
   const INSTANCE_ATTRIBUTE = 'data-condition7-helper-active';
 
   if (document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)) {
@@ -124,8 +129,14 @@
   }
   document.documentElement.setAttribute(INSTANCE_ATTRIBUTE, HELPER_VERSION);
 
-  // Approved users are now checked on your server, not inside this script.
-  const ACCESS_API_URL = 'https://p2rc7dwell.thejacobslab.com/api/c7_check_access.php';
+  // Approved users are checked by Firebase Cloud Function + Firestore, not inside this script.
+  // When the dashboard is hosted on Firebase, /api/checkC7Access is rewritten to the function.
+  // Replace YOUR_FIREBASE_PROJECT_ID only if you still test from file:// before hosting.
+  const FIREBASE_PROJECT_ID = 'p2rc7-c00a3';
+  const FIREBASE_FALLBACK_ORIGIN = `https://${FIREBASE_PROJECT_ID}.web.app`;
+  const ACCESS_API_URL = location.protocol === 'file:'
+    ? `${FIREBASE_FALLBACK_ORIGIN}/api/checkC7Access`
+    : `${location.origin}/api/checkC7Access`;
 
   const REFRESH_MS = 60_000;
   const ACCESS_RECHECK_MS = 15 * 60_000;
@@ -135,6 +146,7 @@
   const SLACK_MEMORY_HOURS = 12;
 
   const FLOW_IDENTITY_URL = 'https://flow-sortation-eu.amazon.com/NCL1/';
+  const FLOW_PERMISSIONS_URL = 'https://flow-sortation-eu.amazon.com/NCL1/permissions';
   const TARGET_URL = 'http://rodeo-dub.amazon.com/NCL1/ItemList?_enabledColumns=on&enabledColumns=OUTER_SCANNABLE_ID&enabledColumns=ASIN_TITLES&WorkPool=Scanned&Fracs=NON_FRACS&DwellTimeGreaterThan=0.5&DwellTimeLessThan=2.1333333333333333&ProcessPath=PPPickToRebin4%2cPPPickToRebin2%2cPPPickToRebin3&shipmentType=CUSTOMER_SHIPMENTS';
 
   // Main dashboard TARGET_URL stays filtered to 30m+ dwell.
@@ -207,7 +219,9 @@
       checkedAt: context?.checkedAt || Date.now(),
       helperVersion: HELPER_VERSION,
       dashboardOrigin: location.origin,
-      dashboardHost: location.hostname
+      dashboardHost: location.hostname,
+      flowPermissionsValid: Boolean(context?.permissionsValid),
+      flowPermissionKeys: Array.isArray(context?.permissionKeys) ? context.permissionKeys.slice(0, 50) : []
     };
 
     GM_xmlhttpRequest({
@@ -225,19 +239,19 @@
         try {
           data = JSON.parse(String(response.responseText || '{}'));
         } catch (error) {
-          callback(new Error(`Cloud access API returned invalid JSON. HTTP ${response.status || 'unknown'}`));
+          callback(new Error(`Firebase access API returned invalid JSON. HTTP ${response.status || 'unknown'}`));
           return;
         }
 
         if (response.status && (response.status < 200 || response.status >= 300)) {
-          callback(new Error(data.message || `Cloud access API returned HTTP ${response.status}`), data);
+          callback(new Error(data.message || `Firebase access API returned HTTP ${response.status}`), data);
           return;
         }
 
         callback(null, data);
       },
-      onerror: () => callback(new Error('Cloud access API request failed. Check the PHP file path, HTTPS, and @connect permission.')),
-      ontimeout: () => callback(new Error('Cloud access API timed out after 15 seconds.'))
+      onerror: () => callback(new Error('Firebase access API request failed. Check Firebase deploy, HTTPS, hosting rewrite, and @connect permission.')),
+      ontimeout: () => callback(new Error('Firebase access API timed out after 15 seconds.'))
     });
   }
 
@@ -249,10 +263,10 @@
 
     sendAccess('checking', {
       login: cached.login,
-      message: 'Checking cloud access…',
-      detail: `Amazon login ${cached.login} was verified from Flow Sortation. Checking server allowlist now.`
+      message: 'Checking Firebase access…',
+      detail: `Amazon login ${cached.login} was verified from Flow Sortation. Checking Firebase allowlist now.`
     });
-    sendStatus('Checking cloud access…', `Verifying ${cached.login} with server allowlist`);
+    sendStatus('Checking Firebase access…', `Verifying ${cached.login} with Firebase allowlist`);
 
     authorizeLoginWithCloud(cached.login, cached, (error, result) => {
       if (error) {
@@ -261,10 +275,10 @@
         stopMonitoring(true);
         sendAccess('error', {
           login: cached.login,
-          message: 'Cloud access check failed',
+          message: 'Firebase access check failed',
           detail: error.message || String(error)
         });
-        sendStatus('Cloud access check failed', error.message || String(error), 'error');
+        sendStatus('Firebase access check failed', error.message || String(error), 'error');
         return;
       }
 
@@ -275,9 +289,9 @@
         sendAccess('denied', {
           login: cached.login,
           message: 'Access denied',
-          detail: result?.message || `${cached.login} is not authorised by the server allowlist.`
+          detail: result?.message || `${cached.login} is not authorised by the Firebase allowlist.`
         });
-        sendStatus('Access denied', `${cached.login} is not approved on the cloud allowlist`, 'error');
+        sendStatus('Access denied', `${cached.login} is not approved on the Firebase allowlist`, 'error');
         return;
       }
 
@@ -288,8 +302,8 @@
         login: currentLogin,
         message: `Access approved for ${currentLogin}`,
         detail: result.expiresAt
-          ? `Cloud authorisation valid until ${result.expiresAt}.`
-          : 'Cloud authorisation approved.'
+          ? `Firebase authorisation valid until ${result.expiresAt}.`
+          : 'Firebase authorisation approved.'
       });
       sendStatus('Access approved', `Signed in as ${currentLogin}`);
       startMonitoring();
@@ -359,7 +373,7 @@
       loginBox.classList.toggle('show', Boolean(login));
       loginBox.innerHTML = login ? `Detected Amazon login: <b>${String(login).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}</b>` : '';
     }
-    if (meta) meta.textContent = `Dashboard v1.4.x • Helper v${HELPER_VERSION} • Flow-capture mode`;
+    if (meta) meta.textContent = `Dashboard v1.6.0 • Helper v${HELPER_VERSION} • Firebase mode`;
     if (user) {
       user.textContent = login ? `Locked • ${login}` : 'Access locked';
       user.classList.remove('ok');
@@ -468,6 +482,89 @@
     return true;
   }
 
+  function gmRequestText(url, options = {}) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') {
+        reject(new Error('GM_xmlhttpRequest is unavailable. Check Tampermonkey @grant permissions.'));
+        return;
+      }
+
+      GM_xmlhttpRequest({
+        method: options.method || 'GET',
+        url,
+        anonymous: false,
+        timeout: options.timeout || 20_000,
+        headers: options.headers || {},
+        data: options.data,
+        onload: response => {
+          const status = Number(response.status || 0);
+          if (status >= 200 && status < 400) {
+            resolve({
+              status,
+              finalUrl: response.finalUrl || response.responseURL || url,
+              text: String(response.responseText || ''),
+              headers: response.responseHeaders || ''
+            });
+            return;
+          }
+          reject(new Error(`Flow Sortation returned HTTP ${status || 'unknown'}`));
+        },
+        ontimeout: () => reject(new Error('Flow Sortation verification request timed out.')),
+        onerror: () => reject(new Error('Could not connect to Flow Sortation.'))
+      });
+    });
+  }
+
+  function looksLikeLoginText(text, finalUrl = '') {
+    const combined = `${finalUrl}\n${String(text || '').slice(0, 250_000)}`;
+    return /midway|sign\s*in|signin|sign-in|login|authentication|sentry|captcha|robot|federat|sso|authportal/i.test(combined);
+  }
+
+  async function verifyFlowLoginInBackground() {
+    const identityUrl = `${FLOW_IDENTITY_URL}${FLOW_IDENTITY_URL.includes('?') ? '&' : '?'}c7IdentityCheck=${Date.now()}`;
+    const mainResponse = await gmRequestText(identityUrl, {
+      timeout: 25_000,
+      headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' }
+    });
+
+    if (looksLikeLoginText(mainResponse.text, mainResponse.finalUrl)) {
+      throw new Error('Flow Sortation authentication is required. Open Flow Sortation and complete Midway login normally.');
+    }
+
+    const login = extractAmazonLogin(mainResponse.text);
+    if (!login) {
+      throw new Error('Flow Sortation loaded, but the logged-in Amazon alias could not be detected.');
+    }
+
+    const permissionsResponse = await gmRequestText(FLOW_PERMISSIONS_URL, {
+      timeout: 15_000,
+      headers: { Accept: 'application/json', 'Cache-Control': 'no-cache', Pragma: 'no-cache' }
+    });
+
+    if (looksLikeLoginText(permissionsResponse.text, permissionsResponse.finalUrl)) {
+      throw new Error('Flow Sortation permissions check returned a login/authentication page. Open Flow Sortation and sign in normally.');
+    }
+
+    let permissions = null;
+    try {
+      permissions = JSON.parse(permissionsResponse.text || '{}');
+    } catch (_) {
+      throw new Error('Flow Sortation permissions did not return valid JSON.');
+    }
+
+    if (!permissions || typeof permissions !== 'object' || Array.isArray(permissions)) {
+      throw new Error('Flow Sortation returned an invalid permissions response.');
+    }
+
+    return {
+      login,
+      checkedAt: Date.now(),
+      source: 'flow-sortation-background-with-permissions',
+      permissionsValid: true,
+      permissionKeys: Object.keys(permissions).filter(key => permissions[key] === true || permissions[key] === 'true')
+    };
+  }
+
   function verifyAccess(force = false) {
     const cachedIdentity = readFlowIdentityCache();
     if (cachedIdentity && cachedIdentity.ageMs <= FLOW_IDENTITY_MAX_AGE_MS) {
@@ -475,31 +572,14 @@
       return;
     }
 
-    // v1.4.5: manual verification mode.
-    // Do not auto-open Flow Sortation and do not use background Flow XHR.
-    // The user clicks the Verify/Open Flow button, the same helper runs on Flow, captures username,
-    // stores it in Tampermonkey storage, then the user returns here and presses Retry/refreshes.
-    accessRequestRunning = false;
-    accessApproved = false;
-    currentLogin = '';
-    stopMonitoring(true);
-    sendAccess('error', {
-      message: cachedIdentity ? 'Flow verification expired' : 'Verify Amazon Login',
-      detail: cachedIdentity
-        ? `Last Flow Sortation verification for ${cachedIdentity.login} is ${Math.round(cachedIdentity.ageMs / 60000)} minute(s) old. Click Verify Amazon Login, wait for the green C7 verified message on Flow Sortation, then return here and press Retry.`
-        : 'Click Verify Amazon Login. Flow Sortation will open in a normal tab. Wait until you see the green C7 verified message, then return here and press Retry or refresh this dashboard.',
-      actions: ['openFlow', 'retryAccess']
-    });
-    sendStatus('Waiting for manual Flow Sortation verification', 'Click Verify Amazon Login, then retry after the green C7 verified message appears', 'error');
-    return;
-
     if (accessRequestRunning) {
       sendAccess('checking', {
         message: 'Still verifying Amazon login…',
-        detail: 'A Flow Sortation identity request is already running. Wait a few seconds or press Retry once.'
+        detail: 'A Flow Sortation verification request is already running. Wait a few seconds or press Retry once.'
       });
       return;
     }
+
     if (!force && accessApproved && currentLogin) {
       sendAccess('approved', {
         login: currentLogin,
@@ -508,127 +588,35 @@
       return;
     }
 
-    const requestId = `flow-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const startedAt = Date.now();
-    const doneFlag = { value: false, stillWaitingTimer: null, hardTimeoutTimer: null };
-    const identityUrl = `${FLOW_IDENTITY_URL}${FLOW_IDENTITY_URL.includes('?') ? '&' : '?'}c7IdentityCheck=${Date.now()}`;
-
     accessRequestRunning = true;
+    accessApproved = false;
+    currentLogin = '';
+    stopMonitoring(true);
+
     sendAccess('checking', {
-      message: 'Verifying Amazon login…',
-      detail: 'Requesting Flow Sortation identity page in the background.'
+      message: 'Verifying Flow Sortation session…',
+      detail: 'Checking Flow main page for your Amazon login, then checking /NCL1/permissions.'
     });
-    sendStatus('Verifying access…', 'Requesting Flow Sortation identity page');
+    sendStatus('Verifying Flow Sortation session…', 'Checking Flow identity and permissions');
 
-    doneFlag.stillWaitingTimer = setTimeout(() => {
-      if (doneFlag.value) return;
-      sendAccess('checking', {
-        message: 'Still verifying Amazon login…',
-        detail: 'No response from Flow Sortation yet. This usually means Tampermonkey @connect permission, Firefox container/session, or Midway redirect is blocking the background request.'
-      });
-      sendStatus('Still verifying access…', 'Waiting for Flow Sortation response');
-    }, 10_000);
-
-    doneFlag.hardTimeoutTimer = setTimeout(() => {
-      finishAccessCheck(requestId, startedAt, doneFlag, elapsedMs => {
+    verifyFlowLoginInBackground()
+      .then(identity => {
+        accessRequestRunning = false;
+        c7StoreFlowLogin(identity.login, identity.source);
+        approveOrDenyCachedLogin(identity);
+      })
+      .catch(error => {
         accessRequestRunning = false;
         accessApproved = false;
         currentLogin = '';
         stopMonitoring(true);
         sendAccess('error', {
-          message: 'Flow Sortation did not respond',
-          detail: `No callback after ${Math.round(elapsedMs / 1000)} seconds. Open Flow Sortation manually in the same Firefox container, then press Retry. Also confirm Tampermonkey accepted @connect access for flow-sortation-eu.amazon.com and Amazon auth domains.`
+          message: 'Verify Amazon Login',
+          detail: `${error?.message || String(error)} Click Verify Amazon Login, wait for the green C7 verified message on Flow Sortation, then return here and press Retry.`,
+          actions: ['openFlow', 'retryAccess']
         });
-        sendStatus('Access verification timed out', 'No Flow Sortation response from the helper', 'error');
+        sendStatus('Waiting for Flow Sortation verification', 'Open Flow Sortation, then retry after the green C7 verified message appears', 'error');
       });
-    }, 35_000);
-
-    GM_xmlhttpRequest({
-      method: 'GET',
-      url: identityUrl,
-      anonymous: false,
-      timeout: 30_000,
-      headers: {
-        'Cache-Control': 'no-cache',
-        Pragma: 'no-cache'
-      },
-      onload: response => {
-        finishAccessCheck(requestId, startedAt, doneFlag, elapsedMs => {
-          accessRequestRunning = false;
-          const responseText = String(response.responseText || '');
-          const summary = flowResponseSummary(response, elapsedMs);
-          console.log('[Condition 7 Standalone] Flow identity response:', summary);
-
-          if (looksLikeAuthenticationPage(response)) {
-            accessApproved = false;
-            currentLogin = '';
-            stopMonitoring(true);
-            sendAccess('login-required', {
-              message: 'Amazon sign-in required',
-              detail: `${summary}. The helper received an authentication or Midway page instead of Flow Sortation. Open Flow Sortation, complete sign-in, then press Retry.`
-            });
-            sendStatus('Amazon sign-in required', 'Open Flow Sortation and sign in, then retry', 'error');
-            return;
-          }
-
-          const login = extractAmazonLogin(responseText);
-          if (login) {
-            currentLogin = login;
-            c7StoreFlowLogin(login, 'flow-sortation-background-response');
-            approveOrDenyCachedLogin({ login, checkedAt: Date.now(), ageMs: 0, source: 'flow-sortation-background-response' });
-            return;
-          }
-
-          if (response.status && (response.status < 200 || response.status >= 400)) {
-            accessApproved = false;
-            currentLogin = '';
-            stopMonitoring(true);
-            sendAccess('error', {
-              message: 'Unable to verify access',
-              detail: `${summary}. Flow Sortation returned an error status and no username was found.`
-            });
-            sendStatus('Access check failed', `Flow Sortation HTTP ${response.status}`, 'error');
-            return;
-          }
-
-          accessApproved = false;
-          currentLogin = '';
-          stopMonitoring(true);
-          sendAccess('error', {
-            message: 'Amazon login could not be identified',
-            detail: `${summary}. The page loaded, but username = 'login' and Welcome, login were not found. Open Flow Sortation manually and confirm it shows Welcome, wprijaco.`
-          });
-          sendStatus('Unable to identify Amazon login', 'Flow Sortation page format may have changed', 'error');
-        });
-      },
-      onerror: error => {
-        finishAccessCheck(requestId, startedAt, doneFlag, elapsedMs => {
-          accessRequestRunning = false;
-          accessApproved = false;
-          currentLogin = '';
-          stopMonitoring(true);
-          console.error('[Condition 7 Standalone] Flow identity request failed:', error);
-          sendAccess('error', {
-            message: 'Access verification failed',
-            detail: `Flow Sortation could not be reached from the helper after ${Math.round(elapsedMs / 1000)} seconds. Check Tampermonkey @connect permission and Firefox container/session.`
-          });
-          sendStatus('Access verification failed', 'Check network, Tampermonkey permissions and Flow Sortation access', 'error');
-        });
-      },
-      ontimeout: () => {
-        finishAccessCheck(requestId, startedAt, doneFlag, elapsedMs => {
-          accessRequestRunning = false;
-          accessApproved = false;
-          currentLogin = '';
-          stopMonitoring(true);
-          sendAccess('error', {
-            message: 'Access verification timed out',
-            detail: `Flow Sortation request timed out after ${Math.round(elapsedMs / 1000)} seconds. Open Flow Sortation in the same Firefox container and try again.`
-          });
-          sendStatus('Access verification timed out', 'Open Flow Sortation and retry', 'error');
-        });
-      }
-    });
   }
 
 
@@ -1326,7 +1314,7 @@
     if (action === 'access-status') {
       sendHelperPong(detail.requestId || '');
       if (accessRequestRunning) {
-        sendAccess('error', { message: 'Verify Amazon Login', detail: 'Click Verify Amazon Login, wait for the green C7 verified message on Flow Sortation, then return here and press Retry.', actions: ['openFlow', 'retryAccess'] });
+        sendAccess('checking', { message: 'Checking Flow/Firebase access…', detail: 'The helper will try background Flow verification first. If it fails, use Verify Amazon Login.', actions: [] });
       } else if (accessApproved) {
         sendAccess('approved', { login: currentLogin, message: `Access approved for ${currentLogin}` });
       } else {
@@ -1400,7 +1388,7 @@
   // Announce the helper immediately; the page will also ping repeatedly in case
   // this event fires before its own listener is attached.
   sendHelperPong('startup');
-  sendAccess('error', { message: 'Verify Amazon Login', detail: 'Click Verify Amazon Login, wait for the green C7 verified message on Flow Sortation, then return here and press Retry.', actions: ['openFlow', 'retryAccess'] });
+  sendAccess('checking', { message: 'Checking Flow/Firebase access…', detail: 'The helper will try background Flow verification first. If it fails, use Verify Amazon Login.', actions: [] });
 
 
   // ===== Prince Jacob Custom Update Checker - Every 10 Hours =====
