@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.6.1
+// @version      1.6.2
 // @description  Firebase Spark/free Condition 7 dashboard helper with direct Firestore allowlist, Flow /permissions verification, GitHub update popup, ExSD Scanned floor totals, Rodeo refresh, and optional Slack alerts.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
@@ -33,7 +33,7 @@
   'use strict';
 
   const FLOW_IDENTITY_CACHE_KEY = 'condition7FlowIdentityCacheV1';
-  const FLOW_CAPTURE_VERSION = '1.6.1';
+  const FLOW_CAPTURE_VERSION = '1.6.2';
 
   function c7IdentityClean(value) {
     return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -120,7 +120,7 @@
   const DASHBOARD_MARKER = 'meta[name="condition7-dashboard"][content="wprijaco-v1"]';
   if (!document.querySelector(DASHBOARD_MARKER)) return;
 
-  const HELPER_VERSION = '1.6.1';
+  const HELPER_VERSION = '1.6.2';
   const INSTANCE_ATTRIBUTE = 'data-condition7-helper-active';
 
   if (document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)) {
@@ -238,14 +238,15 @@
       return;
     }
 
-    const url = `${FIRESTORE_ALLOWED_USERS_BASE}/${encodeURIComponent(safeLogin)}?c7=${Date.now()}`;
+    // Do not add random query params here. Firestore REST rejects unknown query names.
+    const url = `${FIRESTORE_ALLOWED_USERS_BASE}/${encodeURIComponent(safeLogin)}`;
 
     GM_xmlhttpRequest({
       method: 'GET',
       url,
       anonymous: true,
       timeout: 15_000,
-      headers: { Accept: 'application/json' },
+      headers: { Accept: 'application/json', 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
       onload: response => {
         let data = null;
         try {
