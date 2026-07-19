@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.6.2
-// @description  Firebase Spark/free Condition 7 dashboard helper with direct Firestore allowlist, Flow /permissions verification, GitHub update popup, ExSD Scanned floor totals, Rodeo refresh, and optional Slack alerts.
+// @version      1.6.3
+// @description  Firebase Spark/free Condition 7 dashboard helper with safer Flow /permissions verification, direct Firestore allowlist, GitHub update popup, ExSD Scanned floor totals, Rodeo refresh, and optional Slack alerts.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
@@ -33,7 +33,7 @@
   'use strict';
 
   const FLOW_IDENTITY_CACHE_KEY = 'condition7FlowIdentityCacheV1';
-  const FLOW_CAPTURE_VERSION = '1.6.2';
+  const FLOW_CAPTURE_VERSION = '1.6.3';
 
   function c7IdentityClean(value) {
     return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -56,7 +56,7 @@
     return welcomeMatch && welcomeMatch[1] ? c7NormalizeLogin(welcomeMatch[1]) : '';
   }
 
-  function c7StoreFlowLogin(login, source) {
+  function c7StoreFlowLogin(login, source, extra = {}) {
     const safeLogin = c7NormalizeLogin(login);
     if (!safeLogin) return false;
     try {
@@ -64,6 +64,9 @@
         login: safeLogin,
         checkedAt: Date.now(),
         source: source || 'flow-sortation-page',
+        permissionsValid: extra.permissionsValid === true,
+        permissionKeys: Array.isArray(extra.permissionKeys) ? extra.permissionKeys.slice(0, 40) : [],
+        permissionsWarning: extra.permissionsWarning || '',
         helperVersion: FLOW_CAPTURE_VERSION
       }));
       GM_setValue('condition7LastFlowLogin', safeLogin);
@@ -120,7 +123,7 @@
   const DASHBOARD_MARKER = 'meta[name="condition7-dashboard"][content="wprijaco-v1"]';
   if (!document.querySelector(DASHBOARD_MARKER)) return;
 
-  const HELPER_VERSION = '1.6.2';
+  const HELPER_VERSION = '1.6.3';
   const INSTANCE_ATTRIBUTE = 'data-condition7-helper-active';
 
   if (document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)) {
@@ -197,7 +200,15 @@
       const login = normalizeLogin(cached.login);
       const checkedAt = Number(cached.checkedAt || 0);
       if (!login || !checkedAt) return null;
-      return { login, checkedAt, ageMs: Date.now() - checkedAt, source: cached.source || 'flow-cache' };
+      return {
+        login,
+        checkedAt,
+        ageMs: Date.now() - checkedAt,
+        source: cached.source || 'flow-cache',
+        permissionsValid: cached.permissionsValid === true,
+        permissionKeys: Array.isArray(cached.permissionKeys) ? cached.permissionKeys : [],
+        permissionsWarning: cached.permissionsWarning || ''
+      };
     } catch (_) {
       return null;
     }
@@ -316,12 +327,16 @@
     accessApproved = false;
     stopMonitoring(true);
 
+    const flowDiag = cached.permissionsValid
+      ? `Flow alias ✅ ${cached.login} • permissions ✅ ${cached.permissionKeys?.slice(0, 4).join(', ') || 'valid'}`
+      : `Flow alias ✅ ${cached.login} • permissions ⚠️ ${cached.permissionsWarning || 'not confirmed'}`;
+
     sendAccess('checking', {
       login: cached.login,
       message: 'Checking Firebase Firestore access…',
-      detail: `Amazon login ${cached.login} was verified from Flow Sortation. Checking Firebase Firestore allowlist now.`
+      detail: `${flowDiag}. Checking Firebase Firestore allowlist now.`
     });
-    sendStatus('Checking Firebase Firestore access…', `Verifying ${cached.login} with Firebase Firestore allowlist`);
+    sendStatus('Checking Firebase Firestore access…', `${flowDiag} • Firestore allowlist check running`);
 
     authorizeLoginWithCloud(cached.login, cached, (error, result) => {
       if (error) {
@@ -360,7 +375,10 @@
           ? `Firebase Firestore authorisation valid until ${result.expiresAt}.`
           : 'Firebase Firestore authorisation approved.'
       });
-      sendStatus('Access approved', `Signed in as ${currentLogin}`);
+      const approvedDiag = cached.permissionsValid
+        ? `Flow ✅ • Firebase ✅ • signed in as ${currentLogin}`
+        : `Flow alias ✅ • Firebase ✅ • signed in as ${currentLogin} • ${cached.permissionsWarning || 'permissions warning'}`;
+      sendStatus('Access approved', approvedDiag);
       startMonitoring();
     });
   }
@@ -571,12 +589,62 @@
   }
 
   function looksLikeLoginText(text, finalUrl = '') {
-    const combined = `${finalUrl}\n${String(text || '').slice(0, 250_000)}`;
+    const combined = `${finalUrl}
+${String(text || '').slice(0, 250_000)}`;
     return /midway|sign\s*in|signin|sign-in|login|authentication|sentry|captcha|robot|federat|sso|authportal/i.test(combined);
   }
 
+  function makeFlowCacheBustedUrl(baseUrl, key) {
+    return `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}${key}=${Date.now()}`;
+  }
+
+  function parseFlowPermissionsResponse(response) {
+    const text = String(response?.text || '').trim();
+    const status = Number(response?.status || 0);
+
+    if (looksLikeLoginText(text, response?.finalUrl || '')) {
+      throw new Error('Flow Sortation permissions check returned a login/authentication page. Open Flow Sortation and sign in normally.');
+    }
+
+    // HAR inspection showed /NCL1/permissions can be cached or empty in some sessions.
+    // A cache-busted URL is used first, but if Flow still gives 304/empty without a login page,
+    // keep the verified Flow alias and continue with a clear warning instead of locking the dashboard.
+    if (status === 304 || !text) {
+      return {
+        permissionsValid: false,
+        permissionKeys: [],
+        permissionsWarning: `Flow /permissions returned ${status || 'empty'} with no JSON; alias was still verified from Flow main page.`
+      };
+    }
+
+    let permissions = null;
+    try {
+      permissions = JSON.parse(text);
+    } catch (_) {
+      return {
+        permissionsValid: false,
+        permissionKeys: [],
+        permissionsWarning: 'Flow /permissions did not return valid JSON; alias was still verified from Flow main page.'
+      };
+    }
+
+    if (!permissions || typeof permissions !== 'object' || Array.isArray(permissions)) {
+      return {
+        permissionsValid: false,
+        permissionKeys: [],
+        permissionsWarning: 'Flow /permissions returned an unexpected response; alias was still verified from Flow main page.'
+      };
+    }
+
+    return {
+      permissionsValid: true,
+      permissionKeys: Object.keys(permissions).filter(key => permissions[key] === true || permissions[key] === 'true'),
+      permissionsWarning: ''
+    };
+  }
+
   async function verifyFlowLoginInBackground() {
-    const identityUrl = `${FLOW_IDENTITY_URL}${FLOW_IDENTITY_URL.includes('?') ? '&' : '?'}c7IdentityCheck=${Date.now()}`;
+    const identityUrl = makeFlowCacheBustedUrl(FLOW_IDENTITY_URL, 'c7IdentityCheck');
     const mainResponse = await gmRequestText(identityUrl, {
       timeout: 25_000,
       headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' }
@@ -591,32 +659,40 @@
       throw new Error('Flow Sortation loaded, but the logged-in Amazon alias could not be detected.');
     }
 
-    const permissionsResponse = await gmRequestText(FLOW_PERMISSIONS_URL, {
-      timeout: 15_000,
-      headers: { Accept: 'application/json', 'Cache-Control': 'no-cache', Pragma: 'no-cache' }
-    });
+    let permissionInfo = {
+      permissionsValid: false,
+      permissionKeys: [],
+      permissionsWarning: 'Flow /permissions was not checked.'
+    };
 
-    if (looksLikeLoginText(permissionsResponse.text, permissionsResponse.finalUrl)) {
-      throw new Error('Flow Sortation permissions check returned a login/authentication page. Open Flow Sortation and sign in normally.');
-    }
-
-    let permissions = null;
     try {
-      permissions = JSON.parse(permissionsResponse.text || '{}');
-    } catch (_) {
-      throw new Error('Flow Sortation permissions did not return valid JSON.');
-    }
-
-    if (!permissions || typeof permissions !== 'object' || Array.isArray(permissions)) {
-      throw new Error('Flow Sortation returned an invalid permissions response.');
+      const permissionsUrl = makeFlowCacheBustedUrl(FLOW_PERMISSIONS_URL, 'c7PermCheck');
+      const permissionsResponse = await gmRequestText(permissionsUrl, {
+        timeout: 15_000,
+        headers: { Accept: 'application/json', 'Cache-Control': 'no-cache', Pragma: 'no-cache' }
+      });
+      permissionInfo = parseFlowPermissionsResponse(permissionsResponse);
+    } catch (error) {
+      const message = error?.message || String(error);
+      if (/login|auth|midway|captcha|robot|sign/i.test(message)) {
+        throw error;
+      }
+      permissionInfo = {
+        permissionsValid: false,
+        permissionKeys: [],
+        permissionsWarning: `Flow /permissions check was unavailable: ${message}`
+      };
     }
 
     return {
       login,
       checkedAt: Date.now(),
-      source: 'flow-sortation-background-with-permissions',
-      permissionsValid: true,
-      permissionKeys: Object.keys(permissions).filter(key => permissions[key] === true || permissions[key] === 'true')
+      source: permissionInfo.permissionsValid
+        ? 'flow-sortation-background-with-permissions'
+        : 'flow-sortation-background-main-page-only',
+      permissionsValid: permissionInfo.permissionsValid,
+      permissionKeys: permissionInfo.permissionKeys,
+      permissionsWarning: permissionInfo.permissionsWarning
     };
   }
 
@@ -650,14 +726,18 @@
 
     sendAccess('checking', {
       message: 'Verifying Flow Sortation session…',
-      detail: 'Checking Flow main page for your Amazon login, then checking /NCL1/permissions.'
+      detail: 'Checking Flow main page for your Amazon login, then checking /NCL1/permissions with cache-safe fallback.'
     });
-    sendStatus('Verifying Flow Sortation session…', 'Checking Flow identity and permissions');
+    sendStatus('Verifying Flow Sortation session…', 'Flow alias check + cache-safe /permissions check');
 
     verifyFlowLoginInBackground()
       .then(identity => {
         accessRequestRunning = false;
-        c7StoreFlowLogin(identity.login, identity.source);
+        c7StoreFlowLogin(identity.login, identity.source, {
+          permissionsValid: identity.permissionsValid,
+          permissionKeys: identity.permissionKeys,
+          permissionsWarning: identity.permissionsWarning
+        });
         approveOrDenyCachedLogin(identity);
       })
       .catch(error => {
@@ -1353,7 +1433,7 @@
 
   function startMonitoring() {
     if (!dashboardReady || !accessApproved) return;
-    sendStatus('Helper connected', `Signed in as ${currentLogin} • refreshing every 60 seconds`);
+    sendStatus('Helper connected', `Flow ✅ • Firebase ✅ • Rodeo refresh every 60 seconds • signed in as ${currentLogin}`);
     sendSlackStatus();
     fetchNow();
     scheduleRefresh();
@@ -1369,7 +1449,7 @@
     if (action === 'access-status') {
       sendHelperPong(detail.requestId || '');
       if (accessRequestRunning) {
-        sendAccess('checking', { message: 'Checking Flow/Firebase access…', detail: 'The helper will try background Flow verification first. If it fails, use Verify Amazon Login.', actions: [] });
+        sendAccess('checking', { message: 'Checking Flow/Firebase access…', detail: 'The helper will try background Flow verification first using cache-safe /permissions handling. If it fails, use Verify Amazon Login.', actions: [] });
       } else if (accessApproved) {
         sendAccess('approved', { login: currentLogin, message: `Access approved for ${currentLogin}` });
       } else {
@@ -1443,7 +1523,7 @@
   // Announce the helper immediately; the page will also ping repeatedly in case
   // this event fires before its own listener is attached.
   sendHelperPong('startup');
-  sendAccess('checking', { message: 'Checking Flow/Firebase access…', detail: 'The helper will try background Flow verification first. If it fails, use Verify Amazon Login.', actions: [] });
+  sendAccess('checking', { message: 'Checking Flow/Firebase access…', detail: 'The helper will try background Flow verification first using cache-safe /permissions handling. If it fails, use Verify Amazon Login.', actions: [] });
 
 
   // ===== Prince Jacob Custom Update Checker - Every 10 Hours =====
