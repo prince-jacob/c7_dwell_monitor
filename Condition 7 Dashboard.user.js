@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Condition 7 Standalone Dashboard Helper - NCL1
 // @namespace    wprijaco.condition7.standalone.helper
-// @version      1.6.3
-// @description  Firebase Spark/free Condition 7 dashboard helper with safer Flow /permissions verification, direct Firestore allowlist, GitHub update popup, ExSD Scanned floor totals, Rodeo refresh, and optional Slack alerts.
+// @version      1.6.4
+// @description  Firebase Spark/free Condition 7 dashboard helper with React Flow username parsing fix + safer Flow /permissions verification, direct Firestore allowlist, GitHub update popup, ExSD Scanned floor totals, Rodeo refresh, and optional Slack alerts.
 // @author       Prince Jacob (Wprijaco)
 // @updateURL    https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
 // @downloadURL  https://raw.githubusercontent.com/prince-jacob/c7_dwell_monitor/main/Condition%207%20Dashboard.user.js
@@ -33,27 +33,82 @@
   'use strict';
 
   const FLOW_IDENTITY_CACHE_KEY = 'condition7FlowIdentityCacheV1';
-  const FLOW_CAPTURE_VERSION = '1.6.3';
+  const FLOW_CAPTURE_VERSION = '1.6.4';
 
   function c7IdentityClean(value) {
     return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
   }
 
   function c7NormalizeLogin(value) {
-    return c7IdentityClean(value).toLowerCase().replace(/[^a-z0-9._-]/g, '');
+    let login = c7IdentityClean(value).toLowerCase().replace(/[^a-z0-9._-]/g, '');
+
+    // React Flow can save/render navbar text as "Welcome, wprijacoRoutingInbound..."
+    // when text nodes are concatenated. Strip known navbar words if they get glued on.
+    const gluedSuffixes = [
+      'routing', 'inbound', 'afe', 'mainsorter', 'awcs', 'batchbuffer',
+      'tools', 'language', 'english', 'francais', 'français'
+    ];
+
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const suffix of gluedSuffixes) {
+        if (login.length > suffix.length + 2 && login.endsWith(suffix)) {
+          login = login.slice(0, -suffix.length);
+          changed = true;
+        }
+      }
+    }
+
+    return login;
+  }
+
+  function c7ExtractWelcomeLoginFromDocument(doc, htmlFallback = '') {
+    // New React FSD puts the username in a navbar paragraph:
+    // <p class="navbar-text">Welcome, wprijaco</p>
+    const candidates = [];
+
+    try {
+      for (const el of doc.querySelectorAll('.navbar-text, p, span, div')) {
+        const txt = c7IdentityClean(el.textContent || '');
+        if (/^Welcome,\s*/i.test(txt)) candidates.push(txt);
+      }
+    } catch (_) { /* no-op */ }
+
+    const html = String(htmlFallback || '');
+    const htmlPatterns = [
+      /<p[^>]*class=(?:"[^"]*\bnavbar-text\b[^"]*"|'[^']*\bnavbar-text\b[^']*'|[^>\s]*navbar-text[^>\s]*)[^>]*>\s*Welcome,\s*([a-z0-9._-]{3,40})\s*<\/p>/i,
+      /Welcome,\s*([a-z0-9._-]{3,40})(?=\s*<)/i
+    ];
+
+    for (const pattern of htmlPatterns) {
+      const match = html.match(pattern);
+      if (match && match[1]) candidates.push(match[1]);
+    }
+
+    for (const candidate of candidates) {
+      const match = String(candidate || '').match(/^Welcome,\s*([a-z0-9._-]{3,40})\b/i);
+      if (match && match[1]) return c7NormalizeLogin(match[1]);
+    }
+
+    return '';
   }
 
   function c7ExtractFlowLogin(htmlText) {
     const html = String(htmlText || '');
+
     const attrMatch = html.match(/data-ng-init=["'][^"']*username\s*=\s*(?:&quot;|&#34;|['"])([a-z0-9._-]+)(?:&quot;|&#34;|['"])/i);
     if (attrMatch && attrMatch[1]) return c7NormalizeLogin(attrMatch[1]);
 
     const rawMatch = html.match(/username\s*=\s*(?:&quot;|&#34;|['"])([a-z0-9._-]+)(?:&quot;|&#34;|['"])/i);
     if (rawMatch && rawMatch[1]) return c7NormalizeLogin(rawMatch[1]);
 
-    const text = c7IdentityClean(document.body ? document.body.textContent : html);
-    const welcomeMatch = text.match(/Welcome,\s*([a-z0-9._-]+)/i);
-    return welcomeMatch && welcomeMatch[1] ? c7NormalizeLogin(welcomeMatch[1]) : '';
+    const doc = document.implementation.createHTMLDocument('');
+    doc.documentElement.innerHTML = html || (document.documentElement ? document.documentElement.outerHTML : '');
+    const reactWelcomeLogin = c7ExtractWelcomeLoginFromDocument(doc, html);
+    if (reactWelcomeLogin) return reactWelcomeLogin;
+
+    return '';
   }
 
   function c7StoreFlowLogin(login, source, extra = {}) {
@@ -123,7 +178,7 @@
   const DASHBOARD_MARKER = 'meta[name="condition7-dashboard"][content="wprijaco-v1"]';
   if (!document.querySelector(DASHBOARD_MARKER)) return;
 
-  const HELPER_VERSION = '1.6.3';
+  const HELPER_VERSION = '1.6.4';
   const INSTANCE_ATTRIBUTE = 'data-condition7-helper-active';
 
   if (document.documentElement.hasAttribute(INSTANCE_ATTRIBUTE)) {
@@ -500,6 +555,53 @@
 
   /* ---------------------------- Access control ---------------------------- */
 
+  function stripFlowNavbarSuffix(loginValue) {
+    let login = normalizeLogin(loginValue);
+    const gluedSuffixes = [
+      'routing', 'inbound', 'afe', 'mainsorter', 'awcs', 'batchbuffer',
+      'tools', 'language', 'english', 'francais', 'français'
+    ];
+
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const suffix of gluedSuffixes) {
+        if (login.length > suffix.length + 2 && login.endsWith(suffix)) {
+          login = login.slice(0, -suffix.length);
+          changed = true;
+        }
+      }
+    }
+
+    return login;
+  }
+
+  function extractReactFlowWelcomeLogin(doc, html) {
+    const candidates = [];
+
+    for (const el of doc.querySelectorAll('.navbar-text, p, span, div')) {
+      const txt = clean(el.textContent || '');
+      if (/^Welcome,\s*/i.test(txt)) candidates.push(txt);
+    }
+
+    const htmlPatterns = [
+      /<p[^>]*class=(?:"[^"]*\bnavbar-text\b[^"]*"|'[^']*\bnavbar-text\b[^']*'|[^>\s]*navbar-text[^>\s]*)[^>]*>\s*Welcome,\s*([a-z0-9._-]{3,40})\s*<\/p>/i,
+      /Welcome,\s*([a-z0-9._-]{3,40})(?=\s*<)/i
+    ];
+
+    for (const pattern of htmlPatterns) {
+      const match = String(html || '').match(pattern);
+      if (match?.[1]) candidates.push(match[1]);
+    }
+
+    for (const candidate of candidates) {
+      const match = String(candidate || '').match(/^Welcome,\s*([a-z0-9._-]{3,40})\b/i);
+      if (match?.[1]) return stripFlowNavbarSuffix(match[1]);
+    }
+
+    return '';
+  }
+
   function extractAmazonLogin(htmlText) {
     const html = String(htmlText || '');
     const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -507,15 +609,14 @@
     for (const element of doc.querySelectorAll('[data-ng-init]')) {
       const initText = element.getAttribute('data-ng-init') || '';
       const match = initText.match(/(?:^|[;\s])username\s*=\s*['"]([^'"]+)['"]/i);
-      if (match?.[1]) return normalizeLogin(match[1]);
+      if (match?.[1]) return stripFlowNavbarSuffix(match[1]);
     }
 
     const rawMatch = html.match(/username\s*=\s*(?:&quot;|&#34;|['"])([a-z0-9._-]+)(?:&quot;|&#34;|['"])/i);
-    if (rawMatch?.[1]) return normalizeLogin(rawMatch[1]);
+    if (rawMatch?.[1]) return stripFlowNavbarSuffix(rawMatch[1]);
 
-    const pageText = clean(doc.body?.textContent || '');
-    const welcomeMatch = pageText.match(/Welcome,\s*([a-z0-9._-]+)/i);
-    if (welcomeMatch?.[1]) return normalizeLogin(welcomeMatch[1]);
+    const reactWelcomeLogin = extractReactFlowWelcomeLogin(doc, html);
+    if (reactWelcomeLogin) return reactWelcomeLogin;
 
     return '';
   }
